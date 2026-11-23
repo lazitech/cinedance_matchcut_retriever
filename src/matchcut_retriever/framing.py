@@ -115,10 +115,10 @@ def prepare_image(
     # chosen for smooth enlargement without introducing block artifacts.
     interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
     prepared = cv2.resize(cropped, (new_w, new_h), interpolation=interp)
-    # Use the actual x scale after rounding so transformed clicks land on the
-    # same content at either dimension.
-    actual_scale = float(new_w) / float(w)
-    return prepared, ImageTransform(crop=crop, scale=actual_scale)
+    # Keep the conceptual uniform scale in the transform.  The rounded output
+    # dimensions can differ by one pixel on the short axis, but click mapping
+    # should remain tied to the requested long-side scale.
+    return prepared, ImageTransform(crop=crop, scale=scale)
 
 
 def frame_quality(image: np.ndarray) -> dict[str, float | bool]:

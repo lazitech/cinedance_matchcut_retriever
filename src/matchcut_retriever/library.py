@@ -277,7 +277,13 @@ class LibraryBuilder:
         summary = {"clips": 0, "keyframes": 0, "skipped_keyframes": 0, "objects": 0}
         for clip_id in clip_ids:
             cid = str(clip_id)
-            if cid in done or (parts / cid / "objects.parquet").is_file():
+            if cid in done:
+                continue
+            if (parts / cid / "objects.parquet").is_file():
+                # Recover a complete part if a process crashed after its
+                # atomic rename but before updating the marker file.
+                _append_marker(self.root / "processed_clips.txt", cid)
+                done.add(cid)
                 continue
             rows = table[table["clip_id"].astype(str) == cid].sort_values("keyframe_id")
             usable_images: list[np.ndarray] = []
@@ -521,7 +527,6 @@ def main(argv: list[str] | None = None) -> int:
     else:
         clips = _clip_list(root / "clips.txt")
         processed = set(_clip_list(root / "processed_clips.txt")) if (root / "processed_clips.txt").is_file() else set()
-        clips = [cid for cid in clips if cid not in processed]
         if args.shard:
             try:
                 shard_i, shard_n = (int(x) for x in args.shard.split("/", 1))
@@ -529,7 +534,11 @@ def main(argv: list[str] | None = None) -> int:
                     raise ValueError
             except ValueError as exc:
                 raise SystemExit("--shard must be I/N with 0 <= I < N") from exc
+            # Shard positions are defined by the complete clips.txt list, so
+            # already-processed clips do not shift the assignment of later
+            # clips between reruns.
             clips = [cid for pos, cid in enumerate(clips) if pos % shard_n == shard_i]
+        clips = [cid for cid in clips if cid not in processed]
         if args.limit_clips is not None:
             clips = clips[: max(0, args.limit_clips)]
         segmenters = []
