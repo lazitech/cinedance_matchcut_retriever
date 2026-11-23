@@ -49,7 +49,11 @@
 - 用到的字段：
   - `media`：`duration_sec`、`fps`、`width`、`height`、`num_shots`
   - `shots[]`：`shot_no`、`start_sec`、`end_sec`、`shot_type`（`scale` / `angle` / `movement` / …）、`shot_description`、`brief_caption`
-- **待核对**：annotation 里写的分辨率是 1920×1080，但实际文件的高度不一样。要确认时间轴对得上，以及 annotation 里有没有依赖坐标的信息。
+- **已核对（第 1 阶段，2026-11-23）**：
+  - annotation 的 `width`/`height`/`duration_sec` 和实际文件一致；时间都以秒为单位。
+  - dev500 里有 13/500 个 clip 的 `media.fps` 和实际帧率不一致（时长一致），按秒换算帧号时**一律用视频的实际帧率**。
+  - 30 个 clip、353 个官方边界：89.5% 与检出的切点同帧，99.4% 在 ±2 帧内，最多偏 3 帧（官方边界偶尔比实际晚 1–3 帧）。官方漏标的硬切约 4 处（约 1%），其中 2 处是 clip 结尾切黑。
+  - 结论：官方镜头边界可以直接用；关键帧取在 20/50/80% 处，几帧的偏差没有影响。
 
 ### 3.3 检索库（我们生成的）
 
@@ -74,9 +78,9 @@ bakeoff/、eval/           实验输出
 
 | | 本地（`/home/lazic/Desktop/cs180_final_project`） | 服务器（`ssh lvanzhe@172.18.33.12`，`/data0/lvanzhe/cinedance_matchcut_retriever`） |
 |---|---|---|
-| 用途 | 改代码，**只跑单元测试**（合成数据） | 改代码，跑真实数据：建库、实验、评估、Gradio |
+| 用途 | 改代码，跑单元测试（合成数据）；查看服务器拉回来的帧、拼图等结果 | 改代码，跑真实数据：建库、实验、评估、Gradio |
 | 硬件 | 无 GPU，16 核，30 GB 内存，磁盘仅剩约 39 GB | 8× A100 80GB（共享，大多被别人占满），256 线程，440 GB 内存 |
-| 数据 | **不放任何电影数据** | 见第 3 节 |
+| 数据 | 可以放电影数据（帧、拼图、小样本等），前提是本地磁盘够用；重计算（建库、模型推理）仍在服务器上做 | 见第 3 节 |
 
 - Python 环境：两边都用 `uv` 在仓库内建 **Python 3.11** 的 `.venv`，依赖写进 `pyproject.toml` 并锁版本（`uv.lock` 进 git）。服务器上 PyPI 可以直连。
 - 模型权重：服务器连不上 huggingface.co，通过 `hf-mirror.com` 下载（`HF_ENDPOINT` 已在 `.bashrc` 里设置），缓存目录用 `/data2/lvanzhe/hf_cache`。
@@ -177,7 +181,7 @@ bakeoff/、eval/           实验输出
 - 和 `auto_matchcut` 对接、导出 PairConfig、渲染转场
 - 构图/布局通道、运动/光流通道
 - 库内镜头去重
-- 在本地处理真实电影数据
+- 在本地跑建库、模型推理等重计算（本地只看结果、做轻量调试）
 
 ## 8.5 后续可尝试（第一版不做）
 
