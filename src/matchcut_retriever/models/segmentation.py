@@ -34,12 +34,14 @@ class PanopticSegmenter:
     def __init__(self, model_id: str = "facebook/mask2former-swin-large-coco-panoptic", device: str = "cuda", cache_dir=None, batch_size: int = 8):
         torch, transformers = _require_gpu()
         self._torch = torch
+        self.model_id = str(model_id)
         self.device = device
         self.batch_size = int(batch_size)
+        self.params = {"device": self.device, "batch_size": self.batch_size}
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        self.processor = transformers.AutoImageProcessor.from_pretrained(model_id, cache_dir=cache_dir)
-        self.model = transformers.Mask2FormerForUniversalSegmentation.from_pretrained(model_id, cache_dir=cache_dir).to(device).eval()
+        self.processor = transformers.AutoImageProcessor.from_pretrained(self.model_id, cache_dir=cache_dir)
+        self.model = transformers.Mask2FormerForUniversalSegmentation.from_pretrained(self.model_id, cache_dir=cache_dir).to(device).eval()
 
     def _segment_batch(self, images: list[np.ndarray]) -> list[list[Detection]]:
         inputs = _move_inputs(self.processor(images=images, return_tensors="pt"), self.device)
@@ -74,9 +76,10 @@ class _SamBase:
     def __init__(self, model_id: str, device: str, cache_dir):
         torch, transformers = _require_gpu()
         self._torch = torch
+        self.model_id = str(model_id)
         self.device = device
-        self.processor = transformers.Sam2Processor.from_pretrained(model_id, cache_dir=cache_dir)
-        self.model = transformers.Sam2Model.from_pretrained(model_id, cache_dir=cache_dir).to(device).eval()
+        self.processor = transformers.Sam2Processor.from_pretrained(self.model_id, cache_dir=cache_dir)
+        self.model = transformers.Sam2Model.from_pretrained(self.model_id, cache_dir=cache_dir).to(device).eval()
 
     def _embedding(self, image: np.ndarray):
         inputs = _move_inputs(self.processor(images=image, return_tensors="pt"), self.device)
@@ -154,6 +157,13 @@ class SamAutoSegmenter(_SamBase):
         self.stability_thresh = float(stability_thresh)
         self.nms_iou = float(nms_iou)
         self.points_per_batch = int(points_per_batch)
+        self.params = {
+            "points_per_side": self.points_per_side,
+            "pred_iou_thresh": self.pred_iou_thresh,
+            "stability_thresh": self.stability_thresh,
+            "nms_iou": self.nms_iou,
+            "points_per_batch": self.points_per_batch,
+        }
         if self.points_per_batch <= 0:
             raise ValueError("points_per_batch must be positive")
 
