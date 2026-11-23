@@ -2,6 +2,8 @@ import json
 import math
 import os
 import subprocess
+import sys
+import types
 from pathlib import Path
 
 import cv2
@@ -31,6 +33,9 @@ def _mask(kind, shape=(80, 120), center=(60, 40), size=12, angle=0):
     elif kind == "bar":
         x, y = center
         cv2.rectangle(out, (x - size * 2, y - size // 2), (x + size * 2, y + size // 2), 1, -1)
+    elif kind == "ellipse":
+        axes = tuple(size) if isinstance(size, (tuple, list)) else (int(size), int(size))
+        cv2.ellipse(out, center, axes, 0, 0, 360, 1, -1)
     if angle:
         matrix = cv2.getRotationMatrix2D(center, angle, 1)
         out = cv2.warpAffine(out.astype(np.uint8), matrix, (w, h), flags=cv2.INTER_NEAREST).astype(bool)
@@ -245,3 +250,54 @@ def test_cli_separate_configs_and_configured_semantic_weight(library, tmp_path, 
 def test_cli_pool_flags_are_independent():
     args = build_parser().parse_args(["--image", "x", "--x", "1", "--y", "2", "--out", "o", "--coarse-n", "7", "--hard-coarse-n", "9", "--workers", "2"])
     assert args.coarse_n == 7 and args.hard_coarse_n == 9 and args.workers == 2
+
+
+def test_framing_transform_maps_click_and_mask(monkeypatch):
+    class Transform:
+        crop = (20, 10, 180, 90)
+        scale = 4.0
+
+        def to_prepared(self, x, y):
+            return (x - self.crop[0]) * self.scale, (y - self.crop[1]) * self.scale
+
+    def prepare_image(image, long_side=640):
+        assert long_side == 640
+        x0, y0, x1, y1 = Transform.crop
+        cropped = image[y0:y1, x0:x1]
+        prepared = cv2.resize(cropped, (640, 320), interpolation=cv2.INTER_LINEAR)
+        return prepared, Transform()
+
+    module = types.ModuleType("matchcut_retriever.framing")
+    module.prepare_image = prepare_image
+    monkeypatch.setitem(sys.modules, "matchcut_retriever.framing", module)
+
+    image = np.zeros((100, 200, 3), dtype=np.uint8)
+    original_mask = np.zeros((100, 200), dtype=bool)
+    original_mask[30:40, 60:70] = True
+    prepared, x, y, transform = _prepare(image, 65, 35)
+    transformed = _transform_mask(original_mask, prepared.shape, transform)
+    assert prepared.shape[:2] == (320, 640)
+    assert (x, y) == (180.0, 100.0)
+    ys, xs = np.nonzero(transformed)
+    assert xs.min() >= 160 and xs.max() < 200
+    assert ys.min() >= 80 and ys.max() < 120
+
+
+def test_hard_axis_threshold_keeps_mild_elongation_and_rejects_strong(tmp_path):
+    root = make_library(tmp_path / "axis-threshold", [
+        ("query", 0, "ellipse", (100, 140), (70, 50), (24, 20), 0),
+        ("mild", 0, "ellipse", (100, 140), (70, 50), (24, 20), 40),
+    ])
+    lib = Library.load(root)
+    query = QueryObject.from_mask(np.zeros((100, 140, 3), dtype=np.uint8), lib.mask(0))
+    results = rank(lib, query, "hard", params=RetrievalConfig(workers=1, hard_coarse_n=20), k=20)
+    ids = {result.clip_id for result in results}
+    assert "mild" in ids
+    strong_root = make_library(tmp_path / "axis-threshold-strong", [
+        ("query", 0, "ellipse", (100, 140), (70, 50), (36, 12), 0),
+        ("strong", 0, "ellipse", (100, 140), (70, 50), (36, 12), 40),
+    ])
+    strong_lib = Library.load(strong_root)
+    strong_query = QueryObject.from_mask(np.zeros((100, 140, 3), dtype=np.uint8), strong_lib.mask(0))
+    strong_results = rank(strong_lib, strong_query, "hard", params=RetrievalConfig(workers=1, hard_coarse_n=20), k=20)
+    assert "strong" not in {result.clip_id for result in strong_results}

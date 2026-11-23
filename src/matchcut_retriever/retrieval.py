@@ -256,7 +256,8 @@ def rank(library: Library, query: QueryObject, mode: str = "soft", semantic_weig
             c_ecc = library.objects.eccentricity.to_numpy(dtype=float)
             c_angle = library.objects.angle.to_numpy(dtype=float)
             delta = np.abs((c_angle - float(query.geometry.angle) + math.pi / 2) % math.pi - math.pi / 2)
-            feasible &= ~((q_ecc > config.soft_params.ecc_threshold) & (c_ecc > config.soft_params.ecc_threshold) & (delta > math.radians(limits.max_rot_deg) + 1e-9))
+            axis_threshold = float(config.hard_axis_ecc_threshold)
+            feasible &= ~((q_ecc > axis_threshold) & (c_ecc > axis_threshold) & (delta > math.radians(limits.max_rot_deg) + 1e-9))
         survivor_ids = np.flatnonzero(feasible)
         prefilter_time = time.perf_counter() - pre_start
         coarse_n = config.hard_coarse_n

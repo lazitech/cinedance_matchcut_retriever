@@ -24,12 +24,8 @@ def _prepare(image, x, y):
     """Prepare an image to the library's long-side convention."""
     try:
         from .framing import prepare_image  # optional parallel card
-        prepared, transform = prepare_image(image)
-        # Support either a callable coordinate mapper or a transform object.
-        if hasattr(transform, "map_point"):
-            x, y = transform.map_point(float(x), float(y))
-        elif callable(transform):
-            x, y = transform(float(x), float(y))
+        prepared, transform = prepare_image(image, long_side=640)
+        x, y = transform.to_prepared(float(x), float(y))
         return np.asarray(prepared), float(x), float(y), transform
     except (ImportError, ModuleNotFoundError):
         h, w = image.shape[:2]
@@ -42,31 +38,13 @@ def _prepare(image, x, y):
 
 def _transform_mask(mask, prepared_shape, transform):
     """Apply the image preparation transform to a mask with nearest-neighbour sampling."""
-    if mask.shape == prepared_shape[:2]:
+    if transform is None:
         return mask
     if isinstance(transform, (int, float)):
         return np.asarray(Image.fromarray(mask.astype(np.uint8)).resize((prepared_shape[1], prepared_shape[0]), Image.Resampling.NEAREST), dtype=np.uint8) > 0
-    matrix = None
-    if transform is not None:
-        for name in ("map_mask", "apply_mask"):
-            mapper = getattr(transform, name, None)
-            if callable(mapper):
-                return np.asarray(mapper(mask), dtype=bool)
-        if isinstance(transform, dict):
-            matrix = transform.get("matrix", transform.get("affine"))
-        for name in ("matrix", "affine", "to_matrix"):
-            candidate = getattr(transform, name, None) if matrix is None else None
-            if candidate is not None:
-                matrix = candidate() if callable(candidate) else candidate
-                break
-    if matrix is not None:
-        matrix = np.asarray(matrix, dtype=np.float32)
-        if matrix.shape == (3, 3):
-            matrix = matrix[:2]
-        return cv2.warpAffine(mask.astype(np.uint8), matrix, (prepared_shape[1], prepared_shape[0]), flags=cv2.INTER_NEAREST) > 0
-    # A framing implementation without an exposed matrix should still preserve the
-    # output dimensions; nearest-neighbour resizing is the safe fallback.
-    return np.asarray(Image.fromarray(mask.astype(np.uint8)).resize((prepared_shape[1], prepared_shape[0]), Image.Resampling.NEAREST), dtype=np.uint8) > 0
+    x0, y0, x1, y1 = (int(value) for value in transform.crop)
+    cropped = np.asarray(mask, dtype=np.uint8)[y0:y1, x0:x1]
+    return np.asarray(Image.fromarray(cropped).resize((prepared_shape[1], prepared_shape[0]), Image.Resampling.NEAREST), dtype=np.uint8) > 0
 
 
 def _candidate_preview(image, detections, out_path):
@@ -127,7 +105,12 @@ def main(argv=None):
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     image = _read_rgb(args.image)
-    paths = load_paths(args.config) if (args.config or not args.library_root) else None
+    try:
+        paths = load_paths(args.config)
+    except FileNotFoundError:
+        if not args.library_root:
+            raise
+        paths = None
     config = load_retrieval_config(args.retrieval_config)
     semantic = config.semantic_weight if args.semantic is None else float(args.semantic)
     if args.no_clip and semantic != 0.0:
@@ -166,7 +149,7 @@ def main(argv=None):
     render_results(prepared, mask, results, library, out / "grid.jpg")
     payload = {
         "query": {"image": str(args.image), "prepared": bool(args.prepared), "x": float(x), "y": float(y), "mask_index": args.mask_index, "height": int(prepared.shape[0]), "width": int(prepared.shape[1])},
-        "parameters": {"mode": args.mode, "semantic_weight": semantic, "k": config.k, "coarse_n": config.coarse_n, "hard_coarse_n": config.hard_coarse_n, "workers": config.workers, "hard_limits": config.hard_limits.__dict__, "soft_params": config.soft_params.__dict__},
+        "parameters": {"mode": args.mode, "semantic_weight": semantic, "k": config.k, "coarse_n": config.coarse_n, "hard_coarse_n": config.hard_coarse_n, "workers": config.workers, "hard_axis_ecc_threshold": config.hard_axis_ecc_threshold, "hard_limits": config.hard_limits.__dict__, "soft_params": config.soft_params.__dict__},
         "timings": results.timings,
         "results": [item.to_dict() for item in results],
     }

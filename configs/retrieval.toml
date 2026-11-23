@@ -14,3 +14,4 @@ hard_coarse_n = 500
 workers = 8
 k = 20
 semantic_weight = 0.0
+hard_axis_ecc_threshold = 0.8
