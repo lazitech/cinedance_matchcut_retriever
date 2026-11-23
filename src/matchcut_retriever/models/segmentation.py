@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 
-from .common import Detection, mask_nms, point_grid, stability_score
+from .common import Detection, mask_nms, point_grid
 
 
 def _require_gpu() -> tuple[Any, Any]:
@@ -157,32 +157,73 @@ class SamAutoSegmenter(_SamBase):
         if self.points_per_batch <= 0:
             raise ValueError("points_per_batch must be positive")
 
+    def _filtered_batch(self, embedding: Any, image: np.ndarray, batch_points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Predict one prompt batch and return (bool masks, scores) passing both thresholds.
+
+        Thresholds are applied on the GPU to the low-resolution logits, and
+        only the surviving masks are upsampled to the image size, so the CPU
+        never touches the (points x 3) full-resolution logit stack.
+        """
+        torch = self._torch
+        # Sam2Processor expects (image, object, point, coordinate) and
+        # (image, object, point) dimensions when batching independent point
+        # prompts for one image embedding.
+        labels = np.ones((1, len(batch_points), 1), dtype=np.int64)
+        prompt_inputs = _move_inputs(
+            self.processor(images=image, input_points=batch_points[None, :, None, :].tolist(), input_labels=labels.tolist(), return_tensors="pt"),
+            self.device,
+        )
+        with torch.inference_mode():
+            outputs = self.model(
+                image_embeddings=embedding,
+                input_points=prompt_inputs["input_points"],
+                input_labels=prompt_inputs["input_labels"],
+                multimask_output=True,
+            )
+            logits = outputs.pred_masks  # (1, points, 3, h, w) low-resolution logits
+            scores = outputs.iou_scores  # (1, points, 3)
+            logits = logits.reshape(-1, *logits.shape[-2:])
+            scores = scores.reshape(-1).float()
+            # SAM stability score at threshold 0 with offset 1: the mask at
+            # logit > 1 is a subset of the mask at logit > -1, so IoU = high / low.
+            high = (logits > 1.0).flatten(1).sum(1).float()
+            low = (logits > -1.0).flatten(1).sum(1).float()
+            stability = torch.where(low > 0, high / low.clamp_min(1.0), torch.ones_like(low))
+            keep = (scores >= self.pred_iou_thresh) & (stability >= self.stability_thresh)
+            if not bool(keep.any()):
+                return np.empty((0,) + image.shape[:2], dtype=bool), np.empty(0, dtype=np.float32)
+            # post_process_masks interpolates masks[i] per image, so it needs (image, object, mask, h, w).
+            kept_logits = logits[keep][None, :, None]
+            kept_scores = scores[keep]
+            original_sizes = prompt_inputs["original_sizes"]
+            # post_process_masks removes the processor's resize and returns
+            # logits at the original image size; it runs on the logits' device.
+            processed = self.processor.post_process_masks(kept_logits, original_sizes, binarize=False)
+            full = processed[0] if isinstance(processed, (list, tuple)) else processed
+            full = full.reshape(-1, *full.shape[-2:])
+            masks = (full > 0).cpu().numpy()
+        height, width = image.shape[:2]
+        if masks.shape[-2:] != (height, width):
+            raise RuntimeError(f"post-processed SAM masks have shape {masks.shape[-2:]}, expected {(height, width)}")
+        return masks, kept_scores.cpu().numpy().astype(np.float32)
+
     def _segment_one(self, image: np.ndarray) -> list[Detection]:
         embedding, _ = self._embedding(image)
         h, w = image.shape[:2]
         grid = point_grid(self.points_per_side)
         points = grid * np.array([w, h], dtype=np.float32)
         all_masks: list[np.ndarray] = []
-        all_scores: list[float] = []
+        all_scores: list[np.ndarray] = []
         for start in range(0, len(points), self.points_per_batch):
-            batch_points = points[start:start + self.points_per_batch]
-            # Sam2Processor expects (image, object, point, coordinate) and
-            # (image, object, point) dimensions when batching independent
-            # point prompts for one image embedding.
-            labels = np.ones((1, len(batch_points), 1), dtype=np.int64)
-            masks, scores, logits = self._predict(embedding, image, batch_points[None, :, None, :], labels)
-            stable = stability_score(logits, threshold=0.0, offset=1.0)
-            for i in range(masks.shape[0]):
-                for j in range(masks.shape[1]):
-                    if float(scores[i, j]) >= self.pred_iou_thresh and float(stable[i, j]) >= self.stability_thresh:
-                        all_masks.append(masks[i, j])
-                        all_scores.append(float(scores[i, j]))
-        if not all_masks:
+            masks, scores = self._filtered_batch(embedding, image, points[start:start + self.points_per_batch])
+            all_masks.append(masks)
+            all_scores.append(scores)
+        mask_arr = np.concatenate(all_masks) if all_masks else np.empty((0, h, w), dtype=bool)
+        score_arr = np.concatenate(all_scores) if all_scores else np.empty(0, dtype=np.float32)
+        if len(mask_arr) == 0:
             return []
-        mask_arr = np.stack(all_masks)
-        score_arr = np.asarray(all_scores)
         kept = mask_nms(mask_arr, score_arr, self.nms_iou)
-        return [Detection(mask_arr[i], score_arr[i], None, self.name) for i in kept]
+        return [Detection(mask_arr[i], float(score_arr[i]), None, self.name) for i in kept]
 
     def segment(self, images: list[np.ndarray]) -> list[list[Detection]]:
         return [self._segment_one(image) for image in images]
