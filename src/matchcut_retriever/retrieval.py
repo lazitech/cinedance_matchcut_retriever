@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass, asdict, replace
 import logging
+import math
 from pathlib import Path
 import time
 from typing import Any
@@ -246,6 +247,16 @@ def rank(library: Library, query: QueryObject, mode: str = "soft", semantic_weig
     if mode == "hard":
         pre_start = time.perf_counter()
         feasible = hard_prefilter(query.geometry, library.geometry_arrays(), limits)
+        # hard_prefilter is deliberately conservative about geometry. For
+        # clearly elongated objects, principal-axis rotation is also a useful
+        # hard exclusion; near-circular objects skip this check because their
+        # axis is arbitrary (hard_match's within_limits flag is informational).
+        if "angle" in library.objects and "eccentricity" in library.objects:
+            q_ecc = float(query.geometry.eccentricity)
+            c_ecc = library.objects.eccentricity.to_numpy(dtype=float)
+            c_angle = library.objects.angle.to_numpy(dtype=float)
+            delta = np.abs((c_angle - float(query.geometry.angle) + math.pi / 2) % math.pi - math.pi / 2)
+            feasible &= ~((q_ecc > config.soft_params.ecc_threshold) & (c_ecc > config.soft_params.ecc_threshold) & (delta > math.radians(limits.max_rot_deg) + 1e-9))
         survivor_ids = np.flatnonzero(feasible)
         prefilter_time = time.perf_counter() - pre_start
         coarse_n = config.hard_coarse_n
@@ -262,8 +273,6 @@ def rank(library: Library, query: QueryObject, mode: str = "soft", semantic_weig
     rows: list[Result] = []
     query_w = query.mask.shape[1]
     for object_id, match in zip(candidate_ids, matches):
-        if mode == "hard" and not match.within_limits:
-            continue
         row = library.objects.iloc[int(object_id)]
         clip_id, shot_no = str(row.clip_id), int(row.shot_no)
         clip_cos = None

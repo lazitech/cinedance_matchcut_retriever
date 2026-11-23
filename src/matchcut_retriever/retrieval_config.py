@@ -36,7 +36,8 @@ def load_retrieval_config(path: str | Path | None = None) -> RetrievalConfig:
     values: dict = {}
     if target.is_file():
         with target.open("rb") as handle:
-            values = tomllib.load(handle).get("retrieval", {})
+            raw = tomllib.load(handle)
+            values = raw.get("retrieval", raw)
     hard_values = dict(values.get("hard_limits", values.get("hard", {})))
     soft_values = dict(values.get("soft_params", values.get("soft", {})))
     hard_names = {field.name for field in fields(HardLimits)}

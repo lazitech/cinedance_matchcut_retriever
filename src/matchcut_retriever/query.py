@@ -30,14 +30,43 @@ def _prepare(image, x, y):
             x, y = transform.map_point(float(x), float(y))
         elif callable(transform):
             x, y = transform(float(x), float(y))
-        return np.asarray(prepared), float(x), float(y)
+        return np.asarray(prepared), float(x), float(y), transform
     except (ImportError, ModuleNotFoundError):
         h, w = image.shape[:2]
         scale = min(1.0, 640.0 / max(h, w))
         if scale == 1.0:
-            return image, float(x), float(y)
+            return image, float(x), float(y), None
         out = np.asarray(Image.fromarray(image).resize((round(w * scale), round(h * scale)), Image.Resampling.LANCZOS))
-        return out, float(x * scale), float(y * scale)
+        return out, float(x * scale), float(y * scale), scale
+
+
+def _transform_mask(mask, prepared_shape, transform):
+    """Apply the image preparation transform to a mask with nearest-neighbour sampling."""
+    if mask.shape == prepared_shape[:2]:
+        return mask
+    if isinstance(transform, (int, float)):
+        return np.asarray(Image.fromarray(mask.astype(np.uint8)).resize((prepared_shape[1], prepared_shape[0]), Image.Resampling.NEAREST), dtype=np.uint8) > 0
+    matrix = None
+    if transform is not None:
+        for name in ("map_mask", "apply_mask"):
+            mapper = getattr(transform, name, None)
+            if callable(mapper):
+                return np.asarray(mapper(mask), dtype=bool)
+        if isinstance(transform, dict):
+            matrix = transform.get("matrix", transform.get("affine"))
+        for name in ("matrix", "affine", "to_matrix"):
+            candidate = getattr(transform, name, None) if matrix is None else None
+            if candidate is not None:
+                matrix = candidate() if callable(candidate) else candidate
+                break
+    if matrix is not None:
+        matrix = np.asarray(matrix, dtype=np.float32)
+        if matrix.shape == (3, 3):
+            matrix = matrix[:2]
+        return cv2.warpAffine(mask.astype(np.uint8), matrix, (prepared_shape[1], prepared_shape[0]), flags=cv2.INTER_NEAREST) > 0
+    # A framing implementation without an exposed matrix should still preserve the
+    # output dimensions; nearest-neighbour resizing is the safe fallback.
+    return np.asarray(Image.fromarray(mask.astype(np.uint8)).resize((prepared_shape[1], prepared_shape[0]), Image.Resampling.NEAREST), dtype=np.uint8) > 0
 
 
 def _candidate_preview(image, detections, out_path):
@@ -82,9 +111,13 @@ def build_parser():
     parser.add_argument("--max-translate", type=float)
     parser.add_argument("--max-rot", type=float)
     parser.add_argument("--coarse-n", type=int)
+    parser.add_argument("--hard-coarse-n", type=int)
+    parser.add_argument("--workers", type=int)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--out", required=True)
-    parser.add_argument("--config")
+    parser.add_argument("--config", help="local paths TOML")
+    parser.add_argument("--retrieval-config", default=None, help="retrieval TOML")
+    parser.add_argument("--no-clip", action="store_true")
     parser.add_argument("--library-root")
     return parser
 
@@ -94,18 +127,22 @@ def main(argv=None):
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
     image = _read_rgb(args.image)
+    paths = load_paths(args.config) if (args.config or not args.library_root) else None
+    config = load_retrieval_config(args.retrieval_config)
+    semantic = config.semantic_weight if args.semantic is None else float(args.semantic)
+    if args.no_clip and semantic != 0.0:
+        raise ValueError("--no-clip cannot be combined with a non-zero semantic weight")
     if args.prepared:
-        prepared, x, y = image, args.x, args.y
+        prepared, x, y, prep_transform = image, args.x, args.y, None
     else:
-        prepared, x, y = _prepare(image, args.x, args.y)
+        prepared, x, y, prep_transform = _prepare(image, args.x, args.y)
     detections = []
     if args.mask:
         mask = np.asarray(Image.open(args.mask).convert("L")) > 0
-        if mask.shape != prepared.shape[:2]:
-            raise ValueError(f"mask shape {mask.shape} does not match image {prepared.shape[:2]}")
+        mask = _transform_mask(mask, prepared.shape, prep_transform)
     else:
         from .models import SamPointSegmenter
-        detections = SamPointSegmenter(device=args.device).masks_at_point(prepared, x, y)
+        detections = SamPointSegmenter(device=args.device, cache_dir=(paths.hf_cache if paths else None)).masks_at_point(prepared, x, y)
         if not detections:
             raise RuntimeError("SAM returned no masks at the requested point")
         _candidate_preview(prepared, detections, out / "candidates.jpg")
@@ -115,20 +152,14 @@ def main(argv=None):
         mask = detections[index].mask
     Image.fromarray((mask.astype(np.uint8) * 255)).save(out / "query_mask.png")
     clip_vector = None
-    semantic = 0.0 if args.semantic is None else float(args.semantic)
-    if semantic != 0.0:
+    if not args.no_clip:
         from .models import ClipEmbedder
-        clip_vector = ClipEmbedder(device=args.device).embed_masked([prepared], [mask])[0]
-    config = load_retrieval_config(args.config if args.config and Path(args.config).name == "retrieval.toml" else None)
-    config = override_config(config, min_scale=args.min_scale, max_scale=args.max_scale, max_translate_frac=args.max_translate, max_rot_deg=args.max_rot, coarse_n=args.coarse_n, k=args.k, semantic_weight=semantic)
-    if args.coarse_n is not None:
-        from dataclasses import replace
-        config = replace(config, hard_coarse_n=int(args.coarse_n))
+        clip_vector = ClipEmbedder(device=args.device, cache_dir=(paths.hf_cache if paths else None)).embed_masked([prepared], [mask])[0]
+    config = override_config(config, min_scale=args.min_scale, max_scale=args.max_scale, max_translate_frac=args.max_translate, max_rot_deg=args.max_rot, coarse_n=args.coarse_n, hard_coarse_n=args.hard_coarse_n, workers=args.workers, k=args.k, semantic_weight=semantic)
     if args.library_root:
         library_root = Path(args.library_root)
     else:
-        path_cfg = args.config if args.config and "paths" in Path(args.config).read_text() else None
-        library_root = load_paths(path_cfg).library_root
+        library_root = paths.library_root
     library = Library.load(library_root)
     query = QueryObject.from_mask(prepared, mask, clip_vector)
     results = rank(library, query, args.mode, semantic_weight=semantic, k=config.k, params=config)
