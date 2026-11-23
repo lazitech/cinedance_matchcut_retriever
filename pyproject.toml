@@ -17,7 +17,7 @@ dependencies = [
 gpu = [
     "torch>=2.4,<2.15",
     "torchvision>=0.19",
-    "transformers>=4.44",
+    "transformers>=4.56",
     "huggingface_hub>=0.24",
 ]
 

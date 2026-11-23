@@ -308,7 +308,7 @@ requires-dist = [
     { name = "pyarrow", specifier = ">=15" },
     { name = "torch", marker = "extra == 'gpu'", specifier = ">=2.4,<2.15", index = "https://download.pytorch.org/whl/cu126" },
     { name = "torchvision", marker = "extra == 'gpu'", specifier = ">=0.19", index = "https://download.pytorch.org/whl/cu126" },
-    { name = "transformers", marker = "extra == 'gpu'", specifier = ">=4.44" },
+    { name = "transformers", marker = "extra == 'gpu'", specifier = ">=4.56" },
 ]
 provides-extras = ["gpu"]
 
