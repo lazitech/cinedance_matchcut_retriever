@@ -61,3 +61,17 @@ def test_query_cli_on_built_library(tmp_path):
     payload = json.loads((out / "results.json").read_text())
     assert 0 < len(payload["results"]) <= 3
     assert (out / "grid.jpg").is_file()
+
+
+def test_library_with_zero_objects_loads(tmp_path):
+    class EmptySegmenter(FakeSegmenter):
+        def segment(self, images):
+            return [[] for _ in images]
+
+    from matchcut_retriever.library import consolidate
+
+    root = _make_root(tmp_path, clips=("a",), frames_per_clip=1)
+    LibraryBuilder(root, [EmptySegmenter("mask2former")], FakeEmbedder()).process_clips(["a"])
+    consolidate(root)
+    library = Library.load(root)
+    assert len(library.objects) == 0

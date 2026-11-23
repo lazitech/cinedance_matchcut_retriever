@@ -100,10 +100,16 @@ class Result:
 
     @property
     def tx_frac(self) -> float:
+        """X translation as a fraction of the query frame *width*."""
         return self.transform_tx_frac
 
     @property
     def ty_frac(self) -> float:
+        """Y translation as a fraction of the query frame *width* (not height).
+
+        Both axes use the width so the values are on the same scale as
+        ``HardLimits.max_translate_frac`` (a radius in units of the width).
+        """
         return self.transform_ty_frac
 
     def to_dict(self) -> dict[str, Any]:
@@ -167,7 +173,9 @@ class Library:
         if "n_objects" in meta and int(meta["n_objects"]) != n:
             raise ValueError("meta.json n_objects does not match objects.parquet")
         masks_path = root / "index" / "masks.bin"
-        masks_bin = np.memmap(masks_path, mode="r", dtype=np.uint8) if masks_path.is_file() else np.empty(0, dtype=np.uint8)
+        # np.memmap cannot map an empty file (a library whose build kept no objects).
+        has_masks = masks_path.is_file() and masks_path.stat().st_size > 0
+        masks_bin = np.memmap(masks_path, mode="r", dtype=np.uint8) if has_masks else np.empty(0, dtype=np.uint8)
         if "mask_offset" in objects and "mask_nbytes" in objects:
             ends = objects.mask_offset.to_numpy(dtype=np.int64) + objects.mask_nbytes.to_numpy(dtype=np.int64)
             if len(ends) and (np.any(objects.mask_offset.to_numpy(dtype=np.int64) < 0) or np.max(ends) > len(masks_bin)):

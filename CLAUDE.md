@@ -66,7 +66,9 @@ keyframes/<clip_id>/<shot_no>_<k>.jpg   分析分辨率的关键帧（长边约 
 objects.parquet           一行一个对象：object_id, clip_id, shot_no, k, t_s, bbox, centroid, area_frac, 主轴角, mask 的 RLE …
 index/shape_fp.npy        形状指纹 (N_obj × D, float16)
 index/clip_emb.npy        CLIP 向量 (N_obj × 512/768, float16)
-processed_clips.txt       已处理的 clip，用于增量入库
+processed_clips.txt       关键帧已抽完的 clip（data.py keyframes 写）
+objects_processed.txt     对象已入库的 clip（library build 写），用于对象库增量入库
+parts/<clip_id>/          每个 clip 的对象分块（library build 写，consolidate 合并成上面的整库文件）
 bakeoff/、eval/           实验输出
 ```
 
@@ -120,7 +122,7 @@ bakeoff/、eval/           实验输出
    - 几何：bbox、质心、面积占比、主轴角、偏心率（都按帧宽高归一化）。
    - 形状指纹：把 mask 平移到质心、按 √面积 归一化尺度，栅格化成固定大小（如 64×64），再编码成定长向量（候选：降采样的距离变换、或傅里叶/Zernike 描述子），L2 归一化。
    - 语义：用 mask 抠出对象（背景置灰）后算 CLIP 向量。
-5. **增量**：对照 `processed_clips.txt` 只处理新 clip，然后把新条目追加进索引。
+5. **增量**：关键帧阶段对照 `processed_clips.txt`、对象阶段对照 `objects_processed.txt` 只处理新 clip；对象阶段每个 clip 写一个 `parts/<clip_id>/`，再用 `consolidate` 重新合并出整库索引。
 
 ### 6.2 查询
 
