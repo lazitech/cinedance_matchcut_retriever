@@ -1,0 +1,120 @@
+from __future__ import annotations
+
+import builtins
+
+import numpy as np
+import pytest
+
+
+def test_optional_modules_import_without_torch():
+    import matchcut_retriever.bakeoff as bakeoff
+    import matchcut_retriever.models as models
+
+    assert models.Detection is not None
+    assert callable(bakeoff.render_sheet)
+
+
+def _det(area: int, shape=(10, 10), score=1.0):
+    mask = np.zeros(shape, dtype=bool)
+    mask.flat[:area] = True
+    from matchcut_retriever.models import Detection
+
+    return Detection(mask, score)
+
+
+def test_filter_detections_bounds_sort_limit_and_score():
+    from matchcut_retriever.models import filter_detections
+
+    dets = [_det(10, score=0.9), _det(40, score=0.8), _det(1, score=0.99), _det(80, score=0.99)]
+    kept = filter_detections(dets, (10, 10), min_area_frac=0.05, max_area_frac=0.6, max_objects=2, min_score=0.7)
+    assert [d.mask.sum() for d in kept] == [40, 10]
+    assert filter_detections([_det(0)], (10, 10), min_area_frac=0.0) == []
+    assert filter_detections([_det(20, score=0.1)], (10, 10), min_score=0.2) == []
+
+
+def test_point_grid_shape_and_range():
+    from matchcut_retriever.models import point_grid
+
+    points = point_grid(4)
+    assert points.shape == (16, 2)
+    assert np.all(points > 0) and np.all(points < 1)
+    assert np.allclose(points.min(axis=0), 0.125)
+    assert np.allclose(points.max(axis=0), 0.875)
+
+
+def test_stability_score_hand_built_logits():
+    from matchcut_retriever.models import stability_score
+
+    logits = np.array([[[2.0, 0.5], [-2.0, 0.0]], [[2.0, 2.0], [2.0, 2.0]]])
+    # high (>1) and low (>-1): first mask has one pixel in intersection and
+    # three in union; second mask is stable everywhere.
+    assert np.allclose(stability_score(logits), [1 / 3, 1.0])
+
+
+def test_mask_nms_overlap_disjoint_and_empty():
+    from matchcut_retriever.models import mask_nms
+
+    first = np.zeros((6, 6), dtype=bool)
+    first[:3, :3] = True
+    overlap = first.copy()
+    overlap[3, 3] = True
+    disjoint = np.zeros((6, 6), dtype=bool)
+    disjoint[4:, 4:] = True
+    masks = np.stack([first, overlap, disjoint])
+    assert np.array_equal(mask_nms(masks, np.array([0.7, 0.9, 0.4]), 0.5), [1, 2])
+    empty = mask_nms(np.empty((0, 6, 6), dtype=bool), np.empty(0), 0.5)
+    assert empty.dtype == np.int64 and empty.shape == (0,)
+
+
+def test_prepare_masked_crop_fill_letterbox_and_empty():
+    from matchcut_retriever.models import prepare_masked_crop
+
+    image = np.full((10, 20, 3), 10, dtype=np.uint8)
+    mask = np.zeros((10, 20), dtype=bool)
+    mask[2:8, 7:13] = True
+    crop = prepare_masked_crop(image, mask, pad=0, fill=(127, 127, 127), size=20)
+    assert crop.shape == (20, 20, 3) and crop.dtype == np.uint8
+    # The 6x6 crop is square and entirely masked, while the image itself has
+    # no mask pixels outside it. An empty mask is an all-fill crop.
+    assert np.all(crop == 10)
+    empty = prepare_masked_crop(image, np.zeros_like(mask), fill=(7, 8, 9), size=12)
+    assert np.all(empty == np.array([7, 8, 9], dtype=np.uint8))
+
+    # A wide non-square masked bbox must be letterboxed vertically, preserving
+    # its aspect ratio rather than stretching it to the output square.
+    wide = np.zeros((10, 20), dtype=bool)
+    wide[3:7, 4:16] = True
+    wide_image = np.full((10, 20, 3), 200, dtype=np.uint8)
+    wide_crop = prepare_masked_crop(wide_image, wide, pad=0, fill=(1, 2, 3), size=20)
+    assert np.all(wide_crop[:6] == np.array([1, 2, 3], dtype=np.uint8))
+    assert np.all(wide_crop[-6:] == np.array([1, 2, 3], dtype=np.uint8))
+    assert np.all(wide_crop[6:13] == 200)
+
+
+def test_sheet_rendering_synthetic_image_and_detections():
+    from matchcut_retriever.bakeoff import render_sheet
+    from matchcut_retriever.models import Detection
+
+    image = np.zeros((12, 16, 3), dtype=np.uint8)
+    mask = np.zeros((12, 16), dtype=bool)
+    mask[2:8, 3:9] = True
+    sheet = render_sheet(image, {"mask2former": [Detection(mask, 0.8)]})
+    assert sheet.shape[1:] == (32, 3)
+    assert sheet.shape[0] > image.shape[0]
+    assert np.any(sheet[:, 16:] != 0)
+
+
+@pytest.mark.parametrize("wrapper", ["PanopticSegmenter", "SamAutoSegmenter", "SamPointSegmenter", "ClipEmbedder"])
+def test_model_wrappers_require_gpu_extra(monkeypatch, wrapper):
+    import matchcut_retriever.models as models
+
+    original_import = builtins.__import__
+
+    def deny_gpu(name, *args, **kwargs):
+        if name in {"torch", "transformers"}:
+            raise ImportError("blocked for test")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", deny_gpu)
+    with pytest.raises(ImportError, match="gpu extra"):
+        getattr(models, wrapper)()
