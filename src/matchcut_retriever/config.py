@@ -15,6 +15,9 @@ DEFAULT_CONFIG = REPO_ROOT / "configs" / "local.toml"
 class Paths:
     video_root: Path
     manifest_dir: Path
+    # Extracted official annotations: <annotation_dir>/<video_id>.json
+    annotation_dir: Path
+    # One retrieval library (e.g. the 500-clip dev set); everything we generate for it lives here
     library_root: Path
     hf_cache: Path
 

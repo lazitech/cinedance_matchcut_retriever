@@ -53,10 +53,10 @@
 
 ### 3.3 检索库（我们生成的）
 
-根目录 `/data2/lvanzhe/matchcut_library/`（**不放在 /data0**，那里的空间留给下载任务）：
+根目录 `/data2/lvanzhe/matchcut_library/`（**不放在 /data0**，那里的空间留给下载任务）。`raw/annotations/` 放官方 JSON，所有库共用；每个检索库各有一个子目录，即 `configs/local.toml` 里的 `library_root`。开发集是 `dev500/`（从现有 clip 中按固定种子随机抽 500 个，名单在 `dev500/clips.txt`），全量库以后另建 `full/`。每个库目录的结构：
 
 ```
-raw/annotations/          官方 JSON
+clips.txt                 本库包含的 video_id
 shots.parquet             clip_id, shot_no, start_s, end_s, shot_type…, caption
 keyframes/<clip_id>/<shot_no>_<k>.jpg   分析分辨率的关键帧（长边约 640）
 objects.parquet           一行一个对象：object_id, clip_id, shot_no, k, t_s, bbox, centroid, area_frac, 主轴角, mask 的 RLE …
