@@ -24,6 +24,13 @@ gpu = [
 [dependency-groups]
 dev = ["pytest>=8"]
 
+[[tool.uv.index]]
+# files.pythonhosted.org is very slow or unreachable from both dev machines; the lock records
+# this mirror's URLs, so `uv sync` works the same everywhere.
+name = "tuna"
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
