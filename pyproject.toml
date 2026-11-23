@@ -15,7 +15,7 @@ dependencies = [
 [project.optional-dependencies]
 # Model-dependent pieces; installed on the GPU server only.
 gpu = [
-    "torch>=2.4",
+    "torch>=2.4,<2.15",
     "torchvision>=0.19",
     "transformers>=4.44",
     "huggingface_hub>=0.24",
@@ -30,6 +30,16 @@ dev = ["pytest>=8"]
 name = "tuna"
 url = "https://pypi.tuna.tsinghua.edu.cn/simple"
 default = true
+
+[[tool.uv.index]]
+# The GPU server's driver supports CUDA <= 12.8; PyPI's default torch wheels need CUDA 13.
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
 
 [build-system]
 requires = ["hatchling"]
