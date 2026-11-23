@@ -65,3 +65,71 @@ def test_data_pipeline_cli_is_resumable_and_reports_offset(tmp_path):
     main(["check-boundaries", "--config", str(config), "--n", "1"])
     report = json.loads((tmp_path / "library" / "eval" / "boundary_check" / "report.json").read_text())
     assert report["offset_histogram"].get("-3") == 2
+
+
+def test_keyframes_falls_back_when_shots_parquet_is_stale(tmp_path):
+    config = _fixture(tmp_path)
+    main(["select", "--config", str(config), "--n", "1"])
+    main(["shots", "--config", str(config)])
+
+    video_root = tmp_path / "videos"
+    annotation_dir = tmp_path / "annotations"
+    writer = cv2.VideoWriter(str(video_root / "late.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), 10, (64, 48))
+    for index in range(20):
+        writer.write(np.full((48, 64, 3), index * 4, dtype=np.uint8))
+    writer.release()
+    (annotation_dir / "late.json").write_text(
+        json.dumps(
+            {
+                "video_id": "late",
+                "media": {"fps": 10, "width": 64, "height": 48, "duration_sec": 2.0},
+                "shots": [{"shot_no": 0, "start_sec": 0.0, "end_sec": 2.0}],
+            }
+        )
+    )
+    (tmp_path / "library" / "clips.txt").write_text("clip\nlate\n")
+    main(["keyframes", "--config", str(config), "--workers", "1", "--long-side", "32"])
+    keyframes = pd.read_parquet(tmp_path / "library" / "keyframes.parquet")
+    assert len(keyframes[keyframes["clip_id"] == "late"]) == 3
+
+
+def test_boundary_local_peaks_are_low_contrast_and_one_to_one(tmp_path):
+    video_root = tmp_path / "videos"
+    annotation_dir = tmp_path / "annotations"
+    library_root = tmp_path / "library"
+    video_root.mkdir()
+    annotation_dir.mkdir()
+    library_root.mkdir()
+    writer = cv2.VideoWriter(str(video_root / "low.mp4"), cv2.VideoWriter_fourcc(*"mp4v"), 10, (64, 48))
+    for index in range(30):
+        level = 100 if index < 15 else 130  # below the old 0.20 global floor
+        writer.write(np.full((48, 64, 3), level, dtype=np.uint8))
+    writer.release()
+    (annotation_dir / "low.json").write_text(
+        json.dumps(
+            {
+                "video_id": "low",
+                "media": {"fps": 10, "width": 64, "height": 48, "duration_sec": 3.0},
+                "shots": [
+                    {"shot_no": 0, "start_sec": 0.0, "end_sec": 1.4},
+                    {"shot_no": 1, "start_sec": 1.4, "end_sec": 1.6},
+                    {"shot_no": 2, "start_sec": 1.6, "end_sec": 3.0},
+                ],
+            }
+        )
+    )
+    (library_root / "clips.txt").write_text("low\n")
+    config = tmp_path / "config.toml"
+    config.write_text(
+        "[paths]\n"
+        f'video_root="{video_root}"\n'
+        f'manifest_dir="{tmp_path / "manifest"}"\n'
+        f'annotation_dir="{annotation_dir}"\n'
+        f'library_root="{library_root}"\n'
+        f'hf_cache="{tmp_path / "hf"}"\n'
+    )
+    main(["check-boundaries", "--config", str(config), "--n", "1", "--window-frames", "3"])
+    report = json.loads((library_root / "eval" / "boundary_check" / "report.json").read_text())
+    assert report["confirmed_boundaries"] == 1
+    assert report["fraction_annotated_boundaries_confirmed"] == 0.5
+    assert report["boundaries_without_prominent_peak"] == 0

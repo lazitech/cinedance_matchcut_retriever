@@ -6,6 +6,7 @@ import argparse
 import json
 import logging
 import multiprocessing as mp
+import random
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -161,6 +162,7 @@ def command_keyframes(paths: Paths, workers: int, long_side: int) -> None:
     jobs: list[tuple[str, str, list[dict[str, Any]]]] = []
     skipped: set[str] = set()
     existing_ids = set(existing["keyframe_id"].astype(str)) if not existing.empty else set()
+    shot_count = 0
     for clip_id in clips:
         annotation_path = paths.annotation_dir / f"{clip_id}.json"
         if not annotation_path.is_file():
@@ -168,9 +170,16 @@ def command_keyframes(paths: Paths, workers: int, long_side: int) -> None:
             continue
         if shot_table is not None and "clip_id" in shot_table.columns:
             clip_rows = shot_table[shot_table["clip_id"] == clip_id]
-            shots = clip_rows[clip_rows["usable"].astype(bool)].to_dict("records") if "usable" in clip_rows else []
+            if clip_rows.empty:
+                LOG.warning("shots.parquet is stale for %s; falling back to annotation", clip_id)
+                shots = _usable_shots(load_annotation(annotation_path))
+            else:
+                shots = clip_rows[clip_rows["usable"].astype(bool)].to_dict("records") if "usable" in clip_rows else []
         else:
+            if shot_table is not None:
+                LOG.warning("shots.parquet has no clip_id column; falling back to annotation for %s", clip_id)
             shots = _usable_shots(load_annotation(annotation_path))
+        shot_count += len(shots)
         expected = _clip_expected_paths(clip_id, shots)
         expected_ids = {f"{clip_id}:{int(shot['shot_no'])}:{k}" for shot in shots for k in range(3)}
         if all((paths.library_root / path).is_file() for path in expected) and expected_ids.issubset(existing_ids):
@@ -206,10 +215,6 @@ def command_keyframes(paths: Paths, workers: int, long_side: int) -> None:
     processed_path.write_text("".join(f"{clip_id}\n" for clip_id in sorted(processed)))
 
     bytes_on_disk = sum(path.stat().st_size for path in (paths.library_root / "keyframes").rglob("*.jpg")) if (paths.library_root / "keyframes").exists() else 0
-    if shot_table is not None and "usable" in shot_table.columns:
-        shot_count = int(shot_table[shot_table["usable"].astype(bool)].shape[0])
-    else:
-        shot_count = sum(len(_usable_shots(load_annotation(paths.annotation_dir / f"{cid}.json"))) for cid in clips if (paths.annotation_dir / f"{cid}.json").is_file())
     print(
         f"clips={len(clips)} shots={shot_count} "
         f"keyframes={len(existing)} failures={len(failures)} elapsed={time.monotonic() - started:.2f}s bytes={bytes_on_disk}"
@@ -253,8 +258,22 @@ def _detect_cuts(metrics: list[float]) -> list[int]:
     values = np.asarray(metrics[1:], dtype=np.float32)
     median = float(np.median(values))
     mad = float(np.median(np.abs(values - median)))
-    threshold = max(median + 6.0 * mad, median * 3.0 + 0.02, 0.20)
+    threshold = max(median + 6.0 * mad, median * 3.0 + 0.01, 0.06)
     return [index + 1 for index, value in enumerate(values) if float(value) >= threshold]
+
+
+def _local_peak(metrics: list[float], boundary: int, window_frames: int) -> tuple[int | None, float, float]:
+    """Return (frame index, signed offset, prominence) for a boundary-local peak."""
+    if len(metrics) < 2:
+        return None, 0.0, 0.0
+    start = max(1, boundary - window_frames)
+    end = min(len(metrics) - 1, boundary + window_frames)
+    if start > end:
+        return None, 0.0, 0.0
+    peak_idx = max(range(start, end + 1), key=lambda index: metrics[index])
+    median = float(np.median(np.asarray(metrics[1:], dtype=np.float32)))
+    prominence = float(metrics[peak_idx]) / max(median, 1e-6)
+    return peak_idx, float(peak_idx - boundary), prominence
 
 
 def _write_contact_sheet(path: Path, frames: list[np.ndarray | None], labels: list[str]) -> None:
@@ -271,15 +290,43 @@ def _write_contact_sheet(path: Path, frames: list[np.ndarray | None], labels: li
         cv2.imwrite(str(path), np.hstack(tiles), [cv2.IMWRITE_JPEG_QUALITY, 90])
 
 
-def command_check_boundaries(paths: Paths, n: int, seed: int, tolerance_frames: int) -> None:
+def _spread_records(records: list[dict[str, Any]], max_count: int) -> list[dict[str, Any]]:
+    """Select records round-robin by clip so one clip cannot consume the cap."""
+    by_clip: dict[str, list[dict[str, Any]]] = {}
+    for record in records:
+        by_clip.setdefault(str(record["clip_id"]), []).append(record)
+    selected: list[dict[str, Any]] = []
+    while len(selected) < max_count:
+        progressed = False
+        for clip_id in sorted(by_clip):
+            if by_clip[clip_id]:
+                selected.append(by_clip[clip_id].pop(0))
+                progressed = True
+                if len(selected) >= max_count:
+                    break
+        if not progressed:
+            break
+    return selected
+
+
+def command_check_boundaries(
+    paths: Paths,
+    n: int,
+    seed: int,
+    tolerance_frames: int,
+    window_frames: int = 6,
+    min_prominence: float = 4.0,
+    max_sheets: int = 40,
+) -> None:
     clips = _read_clip_list(paths.library_root / "clips.txt")
     selected = select_clips(clips, paths.annotation_dir, min(n, len(clips)), seed)
     out_dir = paths.library_root / "eval" / "boundary_check"
     sheets_dir = out_dir / "sheets"
     offsets: dict[str, int] = {}
     mismatches: list[dict[str, Any]] = []
-    annotated_total = matched_total = unmatched_detected = 0
-    sheet_count = 0
+    annotated_total = confirmed_total = unmatched_detected = 0
+    no_prominent_peak = 0
+    boundary_records: list[dict[str, Any]] = []
 
     for clip_id in selected:
         annotation_path = paths.annotation_dir / f"{clip_id}.json"
@@ -310,32 +357,93 @@ def command_check_boundaries(paths: Paths, n: int, seed: int, tolerance_frames: 
             if int(shot.get("shot_no", 0)) > 0
         ]
         annotated_total += len(boundaries)
-        used_detected: set[int] = set()
+        candidates: list[dict[str, Any]] = []
         for boundary in boundaries:
-            nearest = [(abs(cut - boundary), cut) for cut in detected]
-            if nearest:
-                _, nearest_cut = min(nearest)
-                offset = nearest_cut - boundary
-                offsets[str(offset)] = offsets.get(str(offset), 0) + 1
-                if abs(offset) <= tolerance_frames:
-                    used_detected.add(nearest_cut)
-                    matched_total += 1
-            if sheet_count < 8:
-                indices = [boundary + delta for delta in range(-2, 3)]
-                chosen = [frames[i] if 0 <= i < len(frames) else None for i in indices]
-                _write_contact_sheet(sheets_dir / f"{clip_id}_{boundary:06d}.jpg", chosen, [str(i - boundary) for i in indices])
-                sheet_count += 1
+            peak_idx, offset, prominence = _local_peak(metrics, boundary, window_frames)
+            if peak_idx is not None:
+                offsets[str(int(offset))] = offsets.get(str(int(offset)), 0) + 1
+            prominent = peak_idx is not None and prominence >= min_prominence
+            if not prominent:
+                no_prominent_peak += 1
+            candidates.append(
+                {
+                    "clip_id": clip_id,
+                    "boundary": boundary,
+                    "peak_idx": peak_idx,
+                    "offset": offset,
+                    "prominence": prominence,
+                    "prominent": prominent,
+                    "frames": frames,
+                    "metrics": metrics,
+                }
+            )
+        # Assign each local peak to at most one annotated boundary.  Smallest
+        # absolute offset wins, making nearby duplicate annotations visible.
+        assigned_peaks: set[int] = set()
+        for record in sorted(
+            (item for item in candidates if item["prominent"] and abs(item["offset"]) <= tolerance_frames),
+            key=lambda item: (abs(item["offset"]), item["boundary"]),
+        ):
+            peak_idx = int(record["peak_idx"])
+            if peak_idx not in assigned_peaks:
+                assigned_peaks.add(peak_idx)
+                record["confirmed"] = True
+                confirmed_total += 1
+            else:
+                record["confirmed"] = False
+        for record in candidates:
+            record.setdefault("confirmed", False)
+            boundary_records.append(record)
         unmatched_detected += sum(1 for cut in detected if not any(abs(cut - boundary) <= tolerance_frames for boundary in boundaries))
+
+    # Render every unconfirmed boundary up to the cap, spread across clips, and
+    # a small random comparison sample of confirmed boundaries.
+    unconfirmed = _spread_records([record for record in boundary_records if not record["confirmed"]], max_sheets)
+    confirmed = [record for record in boundary_records if record["confirmed"]]
+    rng = random.Random(seed)
+    comparison = rng.sample(confirmed, min(8, len(confirmed)))
+    # The two groups are disjoint by construction (confirmed vs unconfirmed).
+    sheet_records = unconfirmed + comparison
+    for record in sheet_records:
+        boundary = int(record["boundary"])
+        indices = [boundary + delta for delta in range(-2, 3)]
+        chosen = [record["frames"][i] if 0 <= i < len(record["frames"]) else None for i in indices]
+        offset = int(record["offset"])
+        prominence = float(record["prominence"])
+        name = f"{record['clip_id']}_{boundary:06d}_off{offset:+d}_p{prominence:.1f}.jpg"
+        labels = [f"{delta:+d}" for delta in range(-2, 3)]
+        _write_contact_sheet(sheets_dir / name, chosen, labels)
 
     report = {
         "clips": selected,
-        "fraction_annotated_boundaries_with_detected_cut": (matched_total / annotated_total if annotated_total else 0.0),
-        "fraction_annotated_boundaries_with_cut": (matched_total / annotated_total if annotated_total else 0.0),
+        "tolerance_frames": tolerance_frames,
+        "window_frames": window_frames,
+        "min_prominence": min_prominence,
+        "fraction_annotated_boundaries_confirmed": (confirmed_total / annotated_total if annotated_total else 0.0),
         "annotated_boundaries": annotated_total,
-        "matched_boundaries": matched_total,
+        "confirmed_boundaries": confirmed_total,
         "offset_histogram": offsets,
         "detected_cuts_not_near_annotation": unmatched_detected,
-        "detected_cuts_not_near_any_annotated_boundary": unmatched_detected,
+        "boundaries_without_prominent_peak": no_prominent_peak,
+        "contact_sheets": len(sheet_records),
+        "boundary_peaks": [
+            {
+                "clip_id": record["clip_id"],
+                "annotated_frame": int(record["boundary"]),
+                "peak_frame": int(record["peak_idx"]) if record["peak_idx"] is not None else None,
+                "offset": int(record["offset"]),
+                "prominence": float(record["prominence"]),
+                "prominent": bool(record["prominent"]),
+                "confirmed": bool(record["confirmed"]),
+            }
+            for record in boundary_records
+        ],
+        "definitions": {
+            "fraction_annotated_boundaries_confirmed": "Annotated boundaries whose local peak prominence meets min_prominence, lies within tolerance_frames, and wins one-to-one peak assignment.",
+            "offset_histogram": "Counts of local peak offsets (detected peak frame minus annotated boundary frame), before one-to-one assignment.",
+            "detected_cuts_not_near_annotation": "Global detector cuts farther than tolerance_frames from every annotated boundary.",
+            "boundaries_without_prominent_peak": "Annotated boundaries with no local peak reaching min_prominence in the window.",
+        },
         "per_clip_mismatches": mismatches,
     }
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -363,6 +471,9 @@ def _parser() -> argparse.ArgumentParser:
     boundaries.add_argument("--n", type=int, default=30)
     boundaries.add_argument("--seed", type=int, default=0)
     boundaries.add_argument("--tolerance-frames", type=int, default=2)
+    boundaries.add_argument("--window-frames", type=int, default=6)
+    boundaries.add_argument("--min-prominence", type=float, default=4.0)
+    boundaries.add_argument("--max-sheets", type=int, default=40)
     return parser
 
 
@@ -376,7 +487,15 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "keyframes":
         command_keyframes(paths, args.workers, args.long_side)
     elif args.command == "check-boundaries":
-        command_check_boundaries(paths, args.n, args.seed, args.tolerance_frames)
+        command_check_boundaries(
+            paths,
+            args.n,
+            args.seed,
+            args.tolerance_frames,
+            args.window_frames,
+            args.min_prominence,
+            args.max_sheets,
+        )
     return 0
 
 
