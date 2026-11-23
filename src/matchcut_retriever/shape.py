@@ -467,7 +467,7 @@ def hard_match(q_mask, c_mask, limits=HardLimits()) -> MatchResult:
 
     # Downscale only the coarse canvas. The candidate is warped from its full
     # mask so cover-fit and canvas-center coordinates retain their exact sign.
-    coarse_scale = min(1.0, 128.0 / max(query_height, query_width))
+    coarse_scale = min(1.0, 64.0 / max(query_height, query_width))
     coarse_output = (
         max(1, int(round(query_width * coarse_scale))),
         max(1, int(round(query_height * coarse_scale))),
@@ -477,6 +477,8 @@ def hard_match(q_mask, c_mask, limits=HardLimits()) -> MatchResult:
     )
     candidate_uint8 = c_mask.astype(np.uint8)
     translation_radius = int(math.floor(maximum_translation * coarse_scale))
+    if maximum_translation > 0.0:
+        translation_radius = max(1, translation_radius)
     padded_query = cv2.copyMakeBorder(
         coarse_query, translation_radius, translation_radius,
         translation_radius, translation_radius, cv2.BORDER_CONSTANT, value=0,
@@ -520,7 +522,7 @@ def hard_match(q_mask, c_mask, limits=HardLimits()) -> MatchResult:
                 where=denominator > 0,
             )
             ious[~disc] = -1.0
-            keep = min(2, ious.size)
+            keep = min(3, ious.size)
             flat_indices = np.argpartition(ious.ravel(), -keep)[-keep:]
             for index in flat_indices:
                 row, column = np.unravel_index(index, ious.shape)
@@ -539,10 +541,14 @@ def hard_match(q_mask, c_mask, limits=HardLimits()) -> MatchResult:
                 )
 
     coarse_hypotheses.sort(key=lambda item: item[0], reverse=True)
-    # Refine the best two correlation hypotheses at the normal 160px raster.
+    # Refine the best three correlation hypotheses at the normal 160px raster.
     best_iou = -1.0
     best_transform = projected
-    scale_step = float(np.min(np.diff(scale_values))) if len(scale_values) > 1 else 0.0
+    log_step = (
+        math.log(limits.max_scale / limits.min_scale) / 6.0
+        if limits.max_scale > limits.min_scale else 0.0
+    )
+    scale_factor = math.exp(log_step / 2.0)
     angle_step = maximum_rotation / 4.0 if maximum_rotation else 0.0
     refine_scale = min(1.0, 160.0 / max(query_height, query_width))
     refine_output = (
@@ -552,30 +558,72 @@ def hard_match(q_mask, c_mask, limits=HardLimits()) -> MatchResult:
     refine_query = cv2.resize(
         q_mask.astype(np.uint8), refine_output, interpolation=cv2.INTER_NEAREST
     )
-    translation_step = 1.0 / refine_scale
-    seeds = [item[1] for item in coarse_hypotheses[:2]] or [projected]
+    refine_candidate_size = (
+        max(1, int(round(c_mask.shape[1] * refine_scale))),
+        max(1, int(round(c_mask.shape[0] * refine_scale))),
+    )
+    refine_candidate = cv2.resize(
+        candidate_uint8, refine_candidate_size, interpolation=cv2.INTER_NEAREST
+    )
+    translation_step = 1.0 / coarse_scale
+    seeds = [item[1] for item in coarse_hypotheses[:3]] or [projected]
     for seed in seeds:
-        for scale_delta in (-scale_step / 2.0, 0.0, scale_step / 2.0):
-            for angle_delta in (-angle_step / 2.0, 0.0, angle_step / 2.0):
-                for dx in (-translation_step, 0.0, translation_step):
-                    for dy in (-translation_step, 0.0, translation_step):
-                        candidate = _clip_transform(
-                            Similarity(
-                                seed.scale + scale_delta,
-                                seed.angle + angle_delta,
-                                seed.tx + dx,
-                                seed.ty + dy,
-                            ),
-                            limits,
-                            query_width,
-                        )
-                        iou = _iou_from_query_small(
-                            refine_query, candidate_uint8, candidate, cover_fit,
-                            refine_scale, refine_output, (query_width, query_height),
-                        )
-                        if iou > best_iou:
-                            best_iou = iou
-                            best_transform = candidate
+        current = _clip_transform(seed, limits, query_width)
+        current_iou = _iou_from_small(
+            refine_query, refine_candidate, current, cover_fit,
+            refine_scale, refine_output, (query_width, query_height),
+        )
+        evaluations = 1
+        scale_step = scale_factor
+        local_angle_step = angle_step
+        local_translation_step = translation_step
+        halvings = 0
+        while evaluations < 80 and halvings < 4:
+            moves = (
+                Similarity(current.scale * scale_step, current.angle, current.tx, current.ty),
+                Similarity(current.scale / scale_step, current.angle, current.tx, current.ty),
+                Similarity(current.scale, current.angle + local_angle_step, current.tx, current.ty),
+                Similarity(current.scale, current.angle - local_angle_step, current.tx, current.ty),
+                Similarity(current.scale, current.angle, current.tx + local_translation_step, current.ty),
+                Similarity(current.scale, current.angle, current.tx - local_translation_step, current.ty),
+                Similarity(current.scale, current.angle, current.tx, current.ty + local_translation_step),
+                Similarity(current.scale, current.angle, current.tx, current.ty - local_translation_step),
+            )
+            best_move = current
+            best_move_iou = current_iou
+            for move in moves:
+                if evaluations >= 80:
+                    break
+                candidate = _clip_transform(move, limits, query_width)
+                iou = _iou_from_small(
+                    refine_query, refine_candidate, candidate, cover_fit,
+                    refine_scale, refine_output, (query_width, query_height),
+                )
+                evaluations += 1
+                if iou > best_move_iou:
+                    best_move = candidate
+                    best_move_iou = iou
+            if best_move_iou > current_iou:
+                current = best_move
+                current_iou = best_move_iou
+                if current_iou > best_iou:
+                    best_iou = current_iou
+                    best_transform = current
+            else:
+                scale_step = math.sqrt(scale_step)
+                local_angle_step *= 0.5
+                local_translation_step *= 0.5
+                halvings += 1
+        if current_iou > best_iou:
+            best_iou = current_iou
+            best_transform = current
+    # The cached raster drives the search, but the public score uses the same
+    # full-candidate 160px path as soft matching.
+    best_iou = _warp_iou(q_mask, c_mask, best_transform, cover_fit)
+    projected_iou = _warp_iou(q_mask, c_mask, projected, cover_fit)
+    if projected_iou > best_iou:
+        best_iou = projected_iou
+        best_transform = projected
     return MatchResult(
         iou=float(best_iou),
         cost=_cost(best_transform, (query_width, q_mask.shape[0])),

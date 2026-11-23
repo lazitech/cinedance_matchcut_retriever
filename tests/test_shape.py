@@ -102,3 +102,12 @@ def test_hard_match_respects_non_unit_and_zero_rotation_limits():
         assert math.hypot(transform.tx, transform.ty) <= (
             limits.max_translate_frac * mask.shape[1] + 1e-9
         )
+
+
+def test_hard_match_deterministic_polygon_alignment():
+    candidate = np.zeros((180, 320), dtype=bool)
+    cv2.fillPoly(candidate, [np.array([[90, 45], [150, 55], [125, 125], [70, 110]])], 1)
+    query = np.zeros_like(candidate)
+    cv2.fillPoly(query, [np.array([[125, 50], [185, 60], [160, 130], [105, 115]])], 1)
+    result = hard_match(query, candidate)
+    assert result.iou >= 0.85
