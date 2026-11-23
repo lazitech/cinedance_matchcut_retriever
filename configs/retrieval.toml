@@ -1,0 +1,16 @@
+[retrieval]
+min_scale = 0.8
+max_scale = 1.25
+max_translate_frac = 0.10
+max_rot_deg = 6.0
+allow_rotation = true
+ecc_threshold = 0.3
+cost_weight = 0.1
+scale_norm = 0.25
+translate_norm = 0.25
+rotation_norm_deg = 15.0
+coarse_n = 2000
+hard_coarse_n = 500
+workers = 8
+k = 20
+semantic_weight = 0.0
