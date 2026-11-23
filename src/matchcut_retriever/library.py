@@ -9,6 +9,7 @@ import os
 import shutil
 import tempfile
 import time
+import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -370,8 +371,12 @@ def _cast_objects(frame: pd.DataFrame) -> pd.DataFrame:
     return frame
 
 
-def consolidate(root) -> pd.DataFrame:
-    """Consolidate parts with bounded working memory and atomic replacement."""
+def consolidate(root) -> dict[str, Any]:
+    """Publish a consolidated index with bounded memory.
+
+    Builds and queries must not run concurrently.  An interrupted publish is
+    detected by :func:`verify_library` and repaired by rerunning consolidate.
+    """
     import pyarrow as pa
     import pyarrow.parquet as pq
 
@@ -553,7 +558,16 @@ def consolidate(root) -> pd.DataFrame:
                 if decoded.shape != (frame_h, frame_w):
                     raise ValueError("sampled mask shape disagrees with frame dimensions")
 
+        generation = uuid.uuid4().hex
+        data_paths = {
+            "objects.parquet": temp / "objects.parquet",
+            "index/masks.bin": index / "masks.bin",
+            "index/shape_fp.npy": index / "shape_fp.npy",
+            "index/clip_emb.npy": index / "clip_emb.npy",
+        }
+        byte_sizes = {name: int(path.stat().st_size) for name, path in data_paths.items()}
         meta = {
+            "generation": generation,
             "n_objects": total_objects,
             "segmenter": ",".join(sorted(segments)),
             "segmenter_params": segmenter_params,
@@ -563,14 +577,18 @@ def consolidate(root) -> pd.DataFrame:
             "fingerprint_version": next(iter(fingerprint_versions)) if len(fingerprint_versions) == 1 else 1,
             "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "clips": ids,
+            "bytes": byte_sizes,
         }
         (index / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True))
         root.mkdir(parents=True, exist_ok=True)
+        # Data files are published first.  meta.json is the final consistency
+        # marker and is replaced atomically after all data files are visible.
         os.replace(temp / "objects.parquet", root / "objects.parquet")
         final_index = root / "index"
         final_index.mkdir(exist_ok=True)
-        for name in ("masks.bin", "shape_fp.npy", "clip_emb.npy", "meta.json"):
+        for name in ("masks.bin", "shape_fp.npy", "clip_emb.npy"):
             os.replace(index / name, final_index / name)
+        os.replace(index / "meta.json", final_index / "meta.json")
         for cid in orphan_markers:
             _append_marker(root / "objects_processed.txt", cid)
     finally:
@@ -581,7 +599,50 @@ def consolidate(root) -> pd.DataFrame:
         if clip_mem is not None:
             clip_mem.flush()
         shutil.rmtree(temp, ignore_errors=True)
-    return pd.read_parquet(root / "objects.parquet")
+    verify_library(root)
+    return {
+        "n_objects": total_objects,
+        "n_clips": len(ids),
+        "clip_dim": int(clip_dim),
+        "generation": generation,
+        "bytes": byte_sizes,
+    }
+
+
+def verify_library(root) -> None:
+    """Verify published data files against the final index metadata marker."""
+    import pyarrow.parquet as pq
+
+    root = Path(root)
+    message = "library files are inconsistent with index/meta.json; rerun consolidate"
+    try:
+        meta = json.loads((root / "index" / "meta.json").read_text())
+        if not {"generation", "n_objects", "clip_dim", "bytes"}.issubset(meta):
+            raise ValueError("metadata keys")
+        n_objects = int(meta["n_objects"])
+        clip_dim = int(meta["clip_dim"])
+        expected_bytes = dict(meta["bytes"])
+        paths = {
+            "objects.parquet": root / "objects.parquet",
+            "index/masks.bin": root / "index" / "masks.bin",
+            "index/shape_fp.npy": root / "index" / "shape_fp.npy",
+            "index/clip_emb.npy": root / "index" / "clip_emb.npy",
+        }
+        if any(not path.is_file() for path in paths.values()):
+            raise ValueError("missing data file")
+        if any(int(path.stat().st_size) != int(expected_bytes[name]) for name, path in paths.items()):
+            raise ValueError("byte size")
+        if int(pq.ParquetFile(paths["objects.parquet"]).metadata.num_rows) != n_objects:
+            raise ValueError("parquet rows")
+        shape = tuple(np.load(paths["index/shape_fp.npy"], mmap_mode="r").shape)
+        clip = tuple(np.load(paths["index/clip_emb.npy"], mmap_mode="r").shape)
+        if shape != (n_objects, FINGERPRINT_DIM) or clip != (n_objects, clip_dim):
+            raise ValueError("array shape")
+    except Exception as exc:
+        if isinstance(exc, RuntimeError) and str(exc) == message:
+            raise
+        raise RuntimeError(message) from exc
+
 
 def _outline(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
     out = image.copy()
@@ -674,8 +735,9 @@ def main(argv: list[str] | None = None) -> int:
     paths = load_paths(getattr(args, "config", None))
     root = paths.library_root
     if args.command == "consolidate":
-        consolidate(root)
+        print(json.dumps(consolidate(root), indent=2, sort_keys=True))
     elif args.command == "stats":
+        verify_library(root)
         print(json.dumps(_summary(root), indent=2, sort_keys=True))
     elif args.command == "neighbours":
         neighbours(root, args.n, args.k, args.seed, args.out)
@@ -704,8 +766,7 @@ def main(argv: list[str] | None = None) -> int:
         embedder = ClipEmbedder(device=args.device, cache_dir=paths.hf_cache)
         summary = LibraryBuilder(root, segmenters, embedder, args.max_objects).process_clips(clips)
         if not args.no_consolidate:
-            consolidate(root)
-        summary.update(_summary(root))
+            summary.update(consolidate(root))
         print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
 

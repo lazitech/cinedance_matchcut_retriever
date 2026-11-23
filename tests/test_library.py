@@ -4,6 +4,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pandas as pd
+import pytest
 
 from matchcut_retriever.library import (
     LibraryBuilder,
@@ -12,6 +13,7 @@ from matchcut_retriever.library import (
     consolidate,
     merge_detections,
     neighbours,
+    verify_library,
 )
 from matchcut_retriever.masks import rle_decode
 from matchcut_retriever.models import Detection
@@ -134,7 +136,8 @@ def test_end_to_end_format_and_incremental_build(tmp_path):
     builder = LibraryBuilder(root, [FakeSegmenter("mask2former", "thing"), FakeSegmenter("sam2_auto")], FakeEmbedder(), max_objects=4, batch_size=2)
     summary = builder.process_clips(["a", "b"])
     assert summary["clips"] == 2 and summary["objects"] > 0
-    objects = consolidate(root)
+    summary = consolidate(root)
+    objects = pd.read_parquet(root / "objects.parquet")
     assert objects.columns.tolist() == ["object_id", "keyframe_id", "clip_id", "shot_no", "k", "t_s", "frame_w", "frame_h", "cx", "cy", "area", "area_frac", "bbox_x0", "bbox_y0", "bbox_x1", "bbox_y1", "angle", "eccentricity", "n_components", "solidity", "score", "label", "segmenter", "mask_offset", "mask_nbytes"]
     assert objects.object_id.tolist() == list(range(len(objects)))
     fp = np.load(root / "index/shape_fp.npy"); emb = np.load(root / "index/clip_emb.npy")
@@ -159,6 +162,9 @@ def test_end_to_end_format_and_incremental_build(tmp_path):
     meta = json.loads((root / "index/meta.json").read_text())
     assert {"n_objects", "segmenter", "segmenter_params", "clip_model", "clip_dim", "fingerprint_dim", "fingerprint_version", "built_at", "clips"} <= meta.keys()
     assert meta["n_objects"] == len(objects)
+    assert summary["n_objects"] == len(objects)
+    assert summary["generation"] == meta["generation"]
+    assert summary["bytes"] == meta["bytes"]
     assert "fake/clip" in meta["clip_model"]
     assert "fake/mask2former" in meta["segmenter"]
     assert builder.process_clips(["a", "b"])["clips"] == 0
@@ -246,7 +252,8 @@ def test_orphan_part_is_consolidated_without_resegmentation(tmp_path):
     LibraryBuilder(root, [segmenter], FakeEmbedder()).process_clips(["a"])
     calls = segmenter.calls
     (root / "objects_processed.txt").unlink()
-    objects = consolidate(root)
+    consolidate(root)
+    objects = pd.read_parquet(root / "objects.parquet")
     assert len(objects) > 0
     assert segmenter.calls == calls
     assert (root / "objects_processed.txt").read_text().strip() == "a"
@@ -259,3 +266,18 @@ def test_progress_log_reports_clip_metrics(tmp_path, caplog):
         LibraryBuilder(root, [FakeSegmenter("mask2former")], FakeEmbedder()).process_clips(["a"])
     assert "clips 1/1" in caplog.text
     assert "objects/keyframe" in caplog.text
+
+
+def test_verify_detects_corruption_and_consolidate_repairs(tmp_path):
+    root = _make_root(tmp_path, clips=("a", "b"), frames_per_clip=1)
+    builder = LibraryBuilder(root, [FakeSegmenter("mask2former")], FakeEmbedder())
+    builder.process_clips(["a", "b"])
+    first = consolidate(root)
+    clip_path = root / "index" / "clip_emb.npy"
+    original = clip_path.read_bytes()
+    clip_path.write_bytes(original[:-64])
+    with pytest.raises(RuntimeError, match="library files are inconsistent"):
+        verify_library(root)
+    repaired = consolidate(root)
+    verify_library(root)
+    assert repaired["generation"] != first["generation"]
