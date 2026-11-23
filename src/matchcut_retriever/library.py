@@ -371,11 +371,10 @@ def _cast_objects(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def consolidate(root) -> pd.DataFrame:
-    """Concatenate committed clip parts and validate the resulting index.
+    """Consolidate parts with bounded working memory and atomic replacement."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
 
-    Part masks are copied as a stream and offsets are calculated with NumPy so
-    consolidation does not create one Python object per mask.
-    """
     root = Path(root)
     marker = root / "objects_processed.txt"
     ids: list[str] = []
@@ -385,9 +384,7 @@ def consolidate(root) -> pd.DataFrame:
             if cid not in seen:
                 ids.append(cid)
                 seen.add(cid)
-    # A crash can leave a fully renamed part before its marker line is
-    # appended. Include such orphan parts in canonical clips.txt order so a
-    # consolidate call recovers them without rerunning segmentation.
+
     part_root = root / "parts"
     orphan_parts = {
         path.name for path in part_root.iterdir()
@@ -399,43 +396,37 @@ def consolidate(root) -> pd.DataFrame:
         ordered_orphans.extend(sorted(orphan_parts.difference(ordered_orphans)))
         ids.extend(ordered_orphans)
         seen.update(ordered_orphans)
-    all_frames: list[pd.DataFrame] = []
-    all_fp: list[np.ndarray] = []
-    all_emb: list[np.ndarray] = []
+
+    # Pass 1 only reads parquet/numpy headers and sidecar metadata.
+    descriptors: list[dict[str, Any]] = []
+    total_objects = 0
+    clip_dimensions: set[int] = set()
     segments: set[str] = set()
     segmenter_params: dict[str, Any] = {}
     clip_models: set[str] = set()
     fingerprint_versions: set[int] = set()
-    total_objects = 0
-    total_mask_bytes = 0
-    temp = _temp_dir(root, ".consolidate-")
     for cid in ids:
         part_dir = root / "parts" / cid
-        if not (part_dir / "objects.parquet").is_file():
+        parquet_path = part_dir / "objects.parquet"
+        if not parquet_path.is_file():
             continue
-        part = pd.read_parquet(part_dir / "objects.parquet")
-        nbytes = part["mask_nbytes"].to_numpy(dtype=np.int64, copy=False) if len(part) else np.empty(0, dtype=np.int64)
-        if np.any(nbytes < 0):
-            raise ValueError(f"part {cid} has negative mask sizes")
-        local_offsets = np.zeros(len(part), dtype=np.int64)
-        if len(part) > 1:
-            local_offsets[1:] = np.cumsum(nbytes[:-1], dtype=np.int64)
-        mask_path = part_dir / "masks.bin"
-        part_bytes = mask_path.stat().st_size
-        if int(nbytes.sum(dtype=np.int64)) != part_bytes:
-            raise ValueError(f"part {cid} mask lengths disagree with masks.bin")
-        fp = np.asarray(np.load(part_dir / "shape_fp.npy", mmap_mode="r"))
-        emb = np.asarray(np.load(part_dir / "clip_emb.npy", mmap_mode="r"))
-        if len(part) != len(fp) or len(part) != len(emb):
-            raise ValueError(f"part {cid} array lengths disagree")
-        part = part.copy()
-        part.insert(0, "object_id", np.arange(total_objects, total_objects + len(part), dtype=np.int64))
-        part["mask_offset"] = total_mask_bytes + local_offsets
-        all_frames.append(part)
-        total_objects += len(part)
-        total_mask_bytes += part_bytes
-        all_fp.append(fp.astype(np.float16, copy=False))
-        all_emb.append(emb.astype(np.float16, copy=False))
+        row_count = int(pq.ParquetFile(parquet_path).metadata.num_rows)
+        fp_shape = tuple(np.load(part_dir / "shape_fp.npy", mmap_mode="r").shape)
+        emb_shape = tuple(np.load(part_dir / "clip_emb.npy", mmap_mode="r").shape)
+        if fp_shape != (row_count, FINGERPRINT_DIM):
+            raise ValueError(f"part {cid} fingerprint shape disagrees")
+        if len(emb_shape) != 2 or emb_shape[0] != row_count:
+            raise ValueError(f"part {cid} embedding shape disagrees")
+        if row_count:
+            clip_dimensions.add(int(emb_shape[1]))
+        descriptors.append({
+            "cid": cid,
+            "dir": part_dir,
+            "rows": row_count,
+            "mask_bytes": int((part_dir / "masks.bin").stat().st_size),
+            "global_start": total_objects,
+        })
+        total_objects += row_count
         sidecar = part_dir / "meta.json"
         if sidecar.is_file():
             info = json.loads(sidecar.read_text())
@@ -445,61 +436,133 @@ def consolidate(root) -> pd.DataFrame:
             if "fingerprint_version" in info:
                 fingerprint_versions.add(int(info["fingerprint_version"]))
         else:
-            segments.update(str(value) for value in part["segmenter"].dropna().unique())
-    output = _cast_objects(pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame())
-    fingerprints = np.concatenate(all_fp, axis=0) if all_fp else np.empty((0, FINGERPRINT_DIM), dtype=np.float16)
-    if fingerprints.ndim != 2 or fingerprints.shape != (len(output), FINGERPRINT_DIM):
-        raise ValueError("shape fingerprint array has the wrong shape")
-    if all_emb:
-        dimensions = {array.shape[1] for array in all_emb if array.ndim == 2 and array.shape[0]}
-        if len(dimensions) > 1 or any(array.ndim != 2 for array in all_emb):
-            raise ValueError("CLIP arrays have inconsistent dimensions")
-        clip_dim = next(iter(dimensions), 0)
-        normalized = [array.reshape(0, clip_dim) if array.shape[0] == 0 else array for array in all_emb]
-        clip_embeddings = np.concatenate(normalized, axis=0).astype(np.float16, copy=False)
-    else:
-        clip_dim = 0
-        clip_embeddings = np.empty((0, 0), dtype=np.float16)
-    if len(clip_embeddings) != len(output):
-        raise ValueError("CLIP array length disagrees with objects")
+            columns = pd.read_parquet(parquet_path, columns=["segmenter"])
+            segments.update(str(value) for value in columns["segmenter"].dropna().unique())
+    if len(clip_dimensions) > 1:
+        raise ValueError("CLIP arrays have inconsistent dimensions")
+    clip_dim = next(iter(clip_dimensions), 0)
+    sample_rng = np.random.default_rng(0)
+    sample_indices = set(
+        map(int, sample_rng.choice(total_objects, size=min(1000, total_objects), replace=False))
+    ) if total_objects else set()
+
+    temp = _temp_dir(root, ".consolidate-")
+    writer = None
+    shape_mem = clip_mem = None
+    orphan_markers = set(orphan_parts)
     try:
         index = temp / "index"
         index.mkdir()
+        shape_path = index / "shape_fp.npy"
+        clip_path = index / "clip_emb.npy"
+        shape_mem = np.lib.format.open_memmap(
+            shape_path, mode="w+", dtype=np.float16, shape=(total_objects, FINGERPRINT_DIM)
+        )
+        clip_mem = np.lib.format.open_memmap(
+            clip_path, mode="w+", dtype=np.float16, shape=(total_objects, clip_dim)
+        )
+        schema = pa.schema([
+            pa.field("object_id", pa.int64()),
+            pa.field("keyframe_id", pa.string()),
+            pa.field("clip_id", pa.string()),
+            pa.field("shot_no", pa.int32()),
+            pa.field("k", pa.int8()),
+            pa.field("t_s", pa.float64()),
+            pa.field("frame_w", pa.int32()),
+            pa.field("frame_h", pa.int32()),
+            pa.field("cx", pa.float32()),
+            pa.field("cy", pa.float32()),
+            pa.field("area", pa.float32()),
+            pa.field("area_frac", pa.float32()),
+            pa.field("bbox_x0", pa.int32()),
+            pa.field("bbox_y0", pa.int32()),
+            pa.field("bbox_x1", pa.int32()),
+            pa.field("bbox_y1", pa.int32()),
+            pa.field("angle", pa.float32()),
+            pa.field("eccentricity", pa.float32()),
+            pa.field("n_components", pa.int16()),
+            pa.field("solidity", pa.float32()),
+            pa.field("score", pa.float32()),
+            pa.field("label", pa.string()),
+            pa.field("segmenter", pa.string()),
+            pa.field("mask_offset", pa.int64()),
+            pa.field("mask_nbytes", pa.int32()),
+        ])
+        writer = pq.ParquetWriter(temp / "objects.parquet", schema=schema)
         mask_output = index / "masks.bin"
-        with mask_output.open("wb") as destination:
-            for cid in ids:
-                part_mask = root / "parts" / cid / "masks.bin"
-                if not part_mask.is_file():
-                    continue
-                with part_mask.open("rb") as source:
-                    while True:
-                        chunk = source.read(8 * 1024 * 1024)
-                        if not chunk:
-                            break
-                        destination.write(chunk)
-        # Validate a deterministic bounded sample after all offsets have been
-        # rebased. Full length and range validation happened above.
-        if len(output):
-            rng = np.random.default_rng(0)
-            sample = rng.choice(len(output), size=min(1000, len(output)), replace=False)
-            with mask_output.open("rb") as source:
-                for index_value in np.sort(sample):
-                    record = output.iloc[int(index_value)]
-                    source.seek(int(record.mask_offset))
-                    encoded = source.read(int(record.mask_nbytes))
-                    decoded = rle_decode(encoded)
-                    if decoded.shape != (int(record.frame_h), int(record.frame_w)):
-                        raise ValueError(f"mask shape mismatch for object {record.object_id}")
-        output.to_parquet(temp / "objects.parquet", index=False)
-        np.save(index / "shape_fp.npy", fingerprints)
-        np.save(index / "clip_emb.npy", clip_embeddings)
+        sample_rows: list[tuple[int, int, int, int, int]] = []
+        mask_base = 0
+        for descriptor in descriptors:
+            cid = descriptor["cid"]
+            part_dir = descriptor["dir"]
+            part_path = part_dir / "objects.parquet"
+            part = pd.read_parquet(part_path)
+            nbytes = (
+                part["mask_nbytes"].to_numpy(dtype=np.int64, copy=False)
+                if len(part) else np.empty(0, dtype=np.int64)
+            )
+            if np.any(nbytes < 0):
+                raise ValueError(f"part {cid} has negative mask sizes")
+            local_offsets = np.zeros(len(part), dtype=np.int64)
+            if len(part) > 1:
+                local_offsets[1:] = np.cumsum(nbytes[:-1], dtype=np.int64)
+            if int(nbytes.sum(dtype=np.int64)) != descriptor["mask_bytes"]:
+                raise ValueError(f"part {cid} mask lengths disagree with masks.bin")
+            part.insert(0, "object_id", np.arange(
+                descriptor["global_start"], descriptor["global_start"] + len(part), dtype=np.int64
+            ))
+            part["mask_offset"] = mask_base + local_offsets
+            part = _cast_objects(part)
+            if len(part):
+                shape_values = np.asarray(np.load(part_dir / "shape_fp.npy", mmap_mode="r"))
+                clip_values = np.asarray(np.load(part_dir / "clip_emb.npy", mmap_mode="r"))
+                shape_mem[descriptor["global_start"]:descriptor["global_start"] + len(part)] = shape_values
+                clip_mem[descriptor["global_start"]:descriptor["global_start"] + len(part)] = clip_values
+                local_indices = np.flatnonzero(
+                    np.isin(
+                        np.arange(descriptor["global_start"], descriptor["global_start"] + len(part), dtype=np.int64),
+                        list(sample_indices),
+                    )
+                )
+                for local_index in local_indices:
+                    record = part.iloc[int(local_index)]
+                    sample_rows.append((
+                        int(record.object_id), int(record.mask_offset), int(record.mask_nbytes),
+                        int(record.frame_h), int(record.frame_w),
+                    ))
+            table = pa.Table.from_pandas(part[OBJECT_COLUMNS], schema=schema, preserve_index=False)
+            writer.write_table(table)
+            with (part_dir / "masks.bin").open("rb") as source, mask_output.open("ab") as destination:
+                while True:
+                    chunk = source.read(8 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    destination.write(chunk)
+            mask_base += descriptor["mask_bytes"]
+        shape_mem.flush()
+        clip_mem.flush()
+        del shape_mem, clip_mem
+        shape_mem = clip_mem = None
+        writer.close()
+        writer = None
+
+        with mask_output.open("rb") as source:
+            for _, offset, nbytes, frame_h, frame_w in sample_rows:
+                source.seek(offset)
+                decoded = rle_decode(source.read(nbytes))
+                if decoded.shape != (frame_h, frame_w):
+                    raise ValueError("sampled mask shape disagrees with frame dimensions")
+
         meta = {
-            "n_objects": int(len(output)), "segmenter": ",".join(sorted(segments)),
+            "n_objects": total_objects,
+            "segmenter": ",".join(sorted(segments)),
             "segmenter_params": segmenter_params,
             "clip_model": ",".join(sorted(clip_models)) if clip_models else "clip",
             "clip_dim": int(clip_dim),
-            "fingerprint_dim": int(FINGERPRINT_DIM), "fingerprint_version": (next(iter(fingerprint_versions)) if len(fingerprint_versions) == 1 else 1),
-            "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "clips": ids,
+            "fingerprint_dim": int(FINGERPRINT_DIM),
+            "fingerprint_version": next(iter(fingerprint_versions)) if len(fingerprint_versions) == 1 else 1,
+            "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "clips": ids,
         }
         (index / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True))
         root.mkdir(parents=True, exist_ok=True)
@@ -508,12 +571,17 @@ def consolidate(root) -> pd.DataFrame:
         final_index.mkdir(exist_ok=True)
         for name in ("masks.bin", "shape_fp.npy", "clip_emb.npy", "meta.json"):
             os.replace(index / name, final_index / name)
-        for cid in orphan_parts:
+        for cid in orphan_markers:
             _append_marker(root / "objects_processed.txt", cid)
     finally:
+        if writer is not None:
+            writer.close()
+        if shape_mem is not None:
+            shape_mem.flush()
+        if clip_mem is not None:
+            clip_mem.flush()
         shutil.rmtree(temp, ignore_errors=True)
-    return output
-
+    return pd.read_parquet(root / "objects.parquet")
 
 def _outline(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
     out = image.copy()

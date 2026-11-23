@@ -190,6 +190,7 @@ def test_shards_and_orphan_recovery(tmp_path):
     consolidate(fresh)
     assert pd.read_parquet(root / "objects.parquet").equals(pd.read_parquet(fresh / "objects.parquet"))
     assert np.array_equal(np.load(root / "index/shape_fp.npy"), np.load(fresh / "index/shape_fp.npy"))
+    assert np.array_equal(np.load(root / "index/clip_emb.npy"), np.load(fresh / "index/clip_emb.npy"))
 
 
 def test_neighbours_writes_sheets(tmp_path):
