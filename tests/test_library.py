@@ -34,9 +34,9 @@ class FakeSegmenter:
         for image in images:
             h, w = image.shape[:2]
             masks = []
-            mask = np.zeros((h, w), bool)
-            cv2.circle(mask, (w // 4, h // 2), max(4, min(h, w) // 8), -1)
-            masks.append(Detection(mask, 0.9, self.label, self.source))
+            disc = np.zeros((h, w), np.uint8)
+            cv2.circle(disc, (w // 4, h // 2), max(4, min(h, w) // 8), 1, thickness=-1)
+            masks.append(Detection(disc.astype(bool), 0.9, self.label, self.source))
             if self.source == "sam2_auto":
                 part = np.zeros((h, w), bool)
                 part[h // 2:h // 2 + h // 5, w // 2:w // 2 + w // 5] = True
