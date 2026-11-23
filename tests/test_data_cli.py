@@ -93,6 +93,21 @@ def test_keyframes_falls_back_when_shots_parquet_is_stale(tmp_path):
     assert len(keyframes[keyframes["clip_id"] == "late"]) == 3
 
 
+def test_keyframes_falls_back_when_shots_parquet_lacks_usable_column(tmp_path):
+    config = _fixture(tmp_path)
+    main(["select", "--config", str(config), "--n", "1"])
+    main(["shots", "--config", str(config)])
+    shots_path = tmp_path / "library" / "shots.parquet"
+    shots = pd.read_parquet(shots_path)
+    expected = 3 * int(shots["usable"].sum())
+    assert expected > 0
+    shots.drop(columns=["usable"]).to_parquet(shots_path, index=False)
+
+    main(["keyframes", "--config", str(config), "--workers", "1", "--long-side", "32"])
+    keyframes = pd.read_parquet(tmp_path / "library" / "keyframes.parquet")
+    assert len(keyframes) == expected
+
+
 def test_boundary_local_peaks_are_low_contrast_and_one_to_one(tmp_path):
     video_root = tmp_path / "videos"
     annotation_dir = tmp_path / "annotations"

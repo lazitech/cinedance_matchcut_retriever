@@ -174,7 +174,11 @@ def command_keyframes(paths: Paths, workers: int, long_side: int) -> None:
                 LOG.warning("shots.parquet is stale for %s; falling back to annotation", clip_id)
                 shots = _usable_shots(load_annotation(annotation_path))
             else:
-                shots = clip_rows[clip_rows["usable"].astype(bool)].to_dict("records") if "usable" in clip_rows else []
+                if "usable" in clip_rows:
+                    shots = clip_rows[clip_rows["usable"].astype(bool)].to_dict("records")
+                else:
+                    LOG.warning("shots.parquet has no usable column; falling back to annotation for %s", clip_id)
+                    shots = _usable_shots(load_annotation(annotation_path))
         else:
             if shot_table is not None:
                 LOG.warning("shots.parquet has no clip_id column; falling back to annotation for %s", clip_id)
@@ -373,8 +377,12 @@ def command_check_boundaries(
                     "offset": offset,
                     "prominence": prominence,
                     "prominent": prominent,
-                    "frames": frames,
-                    "metrics": metrics,
+                    # Keep only the -2..+2 preview window for the contact sheet, so a
+                    # clip's full preview list can be freed once the clip is done.
+                    "window": [
+                        frames[i] if 0 <= i < len(frames) else None
+                        for i in range(boundary - 2, boundary + 3)
+                    ],
                 }
             )
         # Assign each local peak to at most one annotated boundary.  Smallest
@@ -406,8 +414,7 @@ def command_check_boundaries(
     sheet_records = unconfirmed + comparison
     for record in sheet_records:
         boundary = int(record["boundary"])
-        indices = [boundary + delta for delta in range(-2, 3)]
-        chosen = [record["frames"][i] if 0 <= i < len(record["frames"]) else None for i in indices]
+        chosen = record["window"]
         offset = int(record["offset"])
         prominence = float(record["prominence"])
         name = f"{record['clip_id']}_{boundary:06d}_off{offset:+d}_p{prominence:.1f}.jpg"
