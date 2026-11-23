@@ -68,14 +68,10 @@ class ClipEmbedder:
         inputs = {k: (v.to(self.device) if hasattr(v, "to") else v) for k, v in inputs.items()}
         with self._torch.inference_mode():
             if hasattr(self.model, "get_image_features"):
-                features = self.model.get_image_features(**inputs)
+                output = self.model.get_image_features(**inputs)
             else:
                 output = self.model(**inputs)
-                features = getattr(output, "image_embeds", None)
-                if features is None:
-                    features = getattr(output, "pooler_output", None)
-                if features is None:
-                    raise RuntimeError("CLIP output has no image_embeds/pooler_output field")
+            features = _projected_image_features(output, self._torch)
             features = self._torch.nn.functional.normalize(features, p=2, dim=-1)
         return features.detach().float().cpu().numpy().astype(np.float32)
 
@@ -91,6 +87,22 @@ class ClipEmbedder:
         if not images:
             return np.empty((0, 0), dtype=np.float32)
         return np.concatenate([self._features(images[start:start + self.batch_size]) for start in range(0, len(images), self.batch_size)], axis=0)
+
+
+def _projected_image_features(output: Any, torch_module: Any) -> Any:
+    """Return projected image embeddings from a CLIP output.
+
+    transformers 4.x ``get_image_features`` returns a tensor; 5.x returns a
+    ``BaseModelOutputWithPooling`` whose ``pooler_output`` holds the projected
+    embedding. A full ``CLIPModel`` forward exposes ``image_embeds``.
+    """
+    if isinstance(output, torch_module.Tensor):
+        return output
+    for name in ("image_embeds", "pooler_output"):
+        features = getattr(output, name, None)
+        if features is not None:
+            return features
+    raise RuntimeError("CLIP output has no image_embeds/pooler_output field")
 
 
 # Also expose the pure helper at module level for data-pipeline callers.

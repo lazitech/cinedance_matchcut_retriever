@@ -118,3 +118,22 @@ def test_model_wrappers_require_gpu_extra(monkeypatch, wrapper):
     monkeypatch.setattr(builtins, "__import__", deny_gpu)
     with pytest.raises(ImportError, match="gpu extra"):
         getattr(models, wrapper)()
+
+
+def test_projected_image_features_handles_tensor_and_output_objects():
+    from types import SimpleNamespace
+
+    from matchcut_retriever.models.clip import _projected_image_features
+
+    class FakeTensor:
+        pass
+
+    fake_torch = SimpleNamespace(Tensor=FakeTensor)
+    tensor = FakeTensor()
+    assert _projected_image_features(tensor, fake_torch) is tensor
+    pooled = object()
+    assert _projected_image_features(SimpleNamespace(pooler_output=pooled), fake_torch) is pooled
+    embeds = object()
+    assert _projected_image_features(SimpleNamespace(image_embeds=embeds, pooler_output=pooled), fake_torch) is embeds
+    with pytest.raises(RuntimeError):
+        _projected_image_features(SimpleNamespace(), fake_torch)
