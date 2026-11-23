@@ -80,7 +80,11 @@ bakeoff/、eval/           实验输出
 
 - Python 环境：两边都用 `uv` 在仓库内建 **Python 3.11** 的 `.venv`，依赖写进 `pyproject.toml` 并锁版本（`uv.lock` 进 git）。服务器上 PyPI 可以直连。
 - 模型权重：服务器连不上 huggingface.co，通过 `hf-mirror.com` 下载（`HF_ENDPOINT` 已在 `.bashrc` 里设置），缓存目录用 `/data2/lvanzhe/hf_cache`。
-- 服务器连不上 github.com，git 的 fetch/push 和 Gradio share 都要走代理。代理用**自己的** `~/clashctl`（`.bashrc` 已加载 `clashctl.sh`），不要用其他用户的 mihomo 进程。第一次用时确认具体命令，再补到这里。
+- 服务器连不上 github.com，git 的 fetch/push 和 Gradio share 都要走代理：`python3 scripts/proxy_run.py -- <命令>`。它会用 `~/clashctl` 订阅 2 里的一个节点，临时起一个只给这条命令用的 mihomo，命令结束就关掉。不要用其他用户的 mihomo 进程，也不要常驻开代理。
+  - 例：`python3 scripts/proxy_run.py -- git pull --ff-only`、`python3 scripts/proxy_run.py -- git push`
+  - 服务器的 remote 是 SSH（`git@github.com:...`），服务器上的 `~/.ssh/id_ed25519` 已经能以 lazitech 身份认证，`proxy_run.py` 会把 ssh 也转进代理。
+  - 服务器上的 `uv` 在 `~/.local/bin`；非交互 ssh 时先 `export PATH=$HOME/.local/bin:$PATH`。
+- PyPI：`files.pythonhosted.org` 在两台机器上都很慢或连不上，`pyproject.toml` 已把默认 index 设为清华镜像，`uv.lock` 里记录的也是镜像地址，`uv sync` 直接用即可。
 
 ### 4.2 GPU
 
