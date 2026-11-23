@@ -1,0 +1,12 @@
+# Copy to configs/local.toml (git-ignored) and adjust for this machine.
+# Values below are the GPU server's layout.
+
+[paths]
+# CineDance live-action clips: <video_root>/<video_id>.mp4 (read-only)
+video_root = "/data0/lvanzhe/CineDance_01/video_live"
+# Shard manifests and labels from the download job (read-only)
+manifest_dir = "/data0/lvanzhe/CineDance_01/manifest"
+# Everything we generate: annotations, keyframes, objects, indexes, experiments
+library_root = "/data2/lvanzhe/matchcut_library"
+# Hugging Face cache for model weights
+hf_cache = "/data2/lvanzhe/hf_cache"

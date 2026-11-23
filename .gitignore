@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Machine-specific config (paths, never secrets in git)
+configs/local.toml
+
+# Data and generated artifacts: CineDance is gated, CC-BY-NC-SA, and this repo is public.
+data*/
+outputs/
+library/
+*.mp4
+*.mov
+*.npy
+*.npz
+*.parquet
+*.pt
+*.pth
+*.safetensors
+*.tar
+*.tar.gz
+*.jpg
+*.jpeg
+*.png
+!docs/figures/**
+
+# Secrets
+.env
+hf_token*
+
+# Tooling
+.playwright-mcp/
