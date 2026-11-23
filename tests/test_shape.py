@@ -55,6 +55,8 @@ def test_hard_match_recovers_in_limit_transform():
     result = hard_match(query, candidate)
     assert result.within_limits
     assert result.iou >= 0.95
+    assert abs(result.transform.tx - 20) <= 2
+    assert abs(result.transform.ty + 10) <= 2
     assert abs(result.transform.angle) <= math.radians(6)
 
 
@@ -85,3 +87,18 @@ def test_prefilter_keeps_random_closed_form_feasible_cases():
         }
         kept = hard_prefilter(object_geometry(query), arrays, limits)[0]
         assert kept or not result.within_limits
+
+
+def test_hard_match_respects_non_unit_and_zero_rotation_limits():
+    mask = _ellipse((30, 12), center=(140, 90), shape=(180, 320))
+    for limits in (
+        HardLimits(min_scale=1.1, max_scale=1.3),
+        HardLimits(min_scale=0.8, max_scale=0.9),
+        HardLimits(max_rot_deg=0.0),
+    ):
+        transform = hard_match(mask, mask, limits).transform
+        assert limits.min_scale <= transform.scale <= limits.max_scale
+        assert abs(transform.angle) <= math.radians(limits.max_rot_deg) + 1e-9
+        assert math.hypot(transform.tx, transform.ty) <= (
+            limits.max_translate_frac * mask.shape[1] + 1e-9
+        )

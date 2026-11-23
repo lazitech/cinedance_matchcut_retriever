@@ -283,14 +283,29 @@ def _warp_iou(query_mask, candidate_mask, transform, cover_fit, long_side=160):
     query_small = cv2.resize(
         query_mask.astype(np.uint8), output_size, interpolation=cv2.INTER_NEAREST
     )
-    transform_matrix = transform.matrix((query_width, query_height))
+    return _iou_from_query_small(
+        query_small, candidate_mask, transform, cover_fit,
+        resize_scale, output_size, (query_width, query_height),
+    )
+
+
+def _iou_from_query_small(
+    query_small, candidate_mask, transform, cover_fit, resize_scale, output_size, query_wh
+):
+    """Compute IoU with a cached query raster and a full candidate mask."""
+
+    transform_matrix = transform.matrix(query_wh)
     homogeneous_cover = np.vstack((cover_fit, [0.0, 0.0, 1.0]))
     homogeneous_transform = np.vstack((transform_matrix, [0.0, 0.0, 1.0]))
     matrix = (homogeneous_transform @ homogeneous_cover)[:2]
-    matrix[:, :2] *= resize_scale
-    matrix[:, 2] *= resize_scale
+    matrix *= resize_scale
+    candidate_array = (
+        candidate_mask
+        if candidate_mask.dtype == np.uint8
+        else candidate_mask.astype(np.uint8)
+    )
     candidate_small = cv2.warpAffine(
-        candidate_mask.astype(np.uint8), matrix, output_size,
+        candidate_array, matrix, output_size,
         flags=cv2.INTER_NEAREST, borderValue=0,
     )
     intersection = np.count_nonzero(query_small & candidate_small)
@@ -406,6 +421,27 @@ def _coarse_translations(centroid_translation, maximum) -> list[np.ndarray]:
     return list(unique.values())
 
 
+def _warp_candidate_canvas(
+    candidate_mask, transform, cover_fit, query_wh, resize_scale, output_size
+):
+    """Warp a full-resolution candidate directly onto a small query canvas."""
+
+    transform_matrix = transform.matrix(query_wh)
+    homogeneous_cover = np.vstack((cover_fit, [0.0, 0.0, 1.0]))
+    homogeneous_transform = np.vstack((transform_matrix, [0.0, 0.0, 1.0]))
+    matrix = (homogeneous_transform @ homogeneous_cover)[:2]
+    matrix *= resize_scale
+    candidate_array = (
+        candidate_mask
+        if candidate_mask.dtype == np.uint8
+        else candidate_mask.astype(np.uint8)
+    )
+    return cv2.warpAffine(
+        candidate_array, matrix, output_size,
+        flags=cv2.INTER_NEAREST, borderValue=0,
+    )
+
+
 def hard_match(q_mask, c_mask, limits=HardLimits()) -> MatchResult:
     """Find best in-limit query-canvas IoU and report closed-form feasibility.
 
@@ -415,7 +451,7 @@ def hard_match(q_mask, c_mask, limits=HardLimits()) -> MatchResult:
     :func:`hard_prefilter`.
     """
 
-    _, query_width = q_mask.shape
+    query_height, query_width = q_mask.shape
     maximum_translation = limits.max_translate_frac * query_width
     maximum_rotation = math.radians(limits.max_rot_deg)
     unrestricted, cover_fit = _closed(q_mask, c_mask, SoftParams())
@@ -429,76 +465,117 @@ def hard_match(q_mask, c_mask, limits=HardLimits()) -> MatchResult:
     )
     projected = _clip_transform(projected_closed, limits, query_width)
 
-    scale_values = np.unique(np.array([
-        limits.min_scale, 1.0, limits.max_scale, projected.scale,
-    ]))
-    angle_values = np.unique(np.array([
-        -maximum_rotation, 0.0, maximum_rotation, projected.angle,
-    ]))
-    query_geometry = object_geometry(q_mask)
-    candidate_geometry = object_geometry(c_mask)
-    hypotheses = []
-    for scale in scale_values:
-        for angle in angle_values:
-            centroid_translation = _centroid_translation(
-                query_geometry, candidate_geometry, cover_fit, float(scale), float(angle)
-            )
-            for translation in _coarse_translations(
-                centroid_translation, maximum_translation
-            ):
-                hypotheses.append(Similarity(
-                    float(scale), float(angle), float(translation[0]), float(translation[1])
-                ))
-    coarse_scale = min(1.0, 64.0 / max(q_mask.shape))
+    # Downscale only the coarse canvas. The candidate is warped from its full
+    # mask so cover-fit and canvas-center coordinates retain their exact sign.
+    coarse_scale = min(1.0, 128.0 / max(query_height, query_width))
     coarse_output = (
-        max(1, int(round(q_mask.shape[1] * coarse_scale))),
-        max(1, int(round(q_mask.shape[0] * coarse_scale))),
+        max(1, int(round(query_width * coarse_scale))),
+        max(1, int(round(query_height * coarse_scale))),
     )
     coarse_query = cv2.resize(
         q_mask.astype(np.uint8), coarse_output, interpolation=cv2.INTER_NEAREST
     )
-    coarse_candidate_size = (
-        max(1, int(round(c_mask.shape[1] * coarse_scale))),
-        max(1, int(round(c_mask.shape[0] * coarse_scale))),
+    candidate_uint8 = c_mask.astype(np.uint8)
+    translation_radius = int(math.floor(maximum_translation * coarse_scale))
+    padded_query = cv2.copyMakeBorder(
+        coarse_query, translation_radius, translation_radius,
+        translation_radius, translation_radius, cv2.BORDER_CONSTANT, value=0,
     )
-    coarse_candidate = cv2.resize(
-        c_mask.astype(np.uint8), coarse_candidate_size, interpolation=cv2.INTER_NEAREST
+    padded_ones = cv2.copyMakeBorder(
+        np.ones_like(coarse_query), translation_radius, translation_radius,
+        translation_radius, translation_radius, cv2.BORDER_CONSTANT, value=0,
     )
-    coarse = [
-        (
-            _iou_from_small(
-                coarse_query, coarse_candidate, hypothesis, cover_fit,
-                coarse_scale, coarse_output, (query_width, q_mask.shape[0])
-            ),
-            hypothesis,
-        )
-        for hypothesis in hypotheses
+    query_area = float(np.count_nonzero(coarse_query))
+    yy, xx = np.mgrid[
+        -translation_radius:translation_radius + 1,
+        -translation_radius:translation_radius + 1,
     ]
-    coarse.sort(key=lambda item: item[0], reverse=True)
-    best_iou, best_transform = coarse[0]
-    best_iou = _warp_iou(q_mask, c_mask, best_transform, cover_fit)
-    projected_iou = _warp_iou(q_mask, c_mask, projected, cover_fit)
-    if projected_iou > best_iou:
-        best_iou, best_transform = projected_iou, projected
+    disc = (xx * xx + yy * yy) <= translation_radius * translation_radius
 
-    scale_step = max(0.01, (limits.max_scale - limits.min_scale) / 20.0)
-    angle_step = max(math.radians(0.25), maximum_rotation / 6.0)
-    # The projected closed form is refined explicitly; the coarse winner was
-    # already evaluated at full resolution above.
-    seeds = [projected]
-    for seed in seeds:
-        for scale_delta in (-scale_step, 0.0, scale_step):
-            for angle_delta in (-angle_step, 0.0, angle_step):
-                candidate = _clip_transform(
-                    Similarity(
-                        seed.scale + scale_delta, seed.angle + angle_delta,
-                        seed.tx, seed.ty,
-                    ), limits, query_width
+    scale_values = np.geomspace(limits.min_scale, limits.max_scale, 7)
+    scale_values = np.unique(np.concatenate((scale_values, [projected.scale])))
+    if maximum_rotation == 0.0:
+        angle_values = np.array([0.0])
+    else:
+        angle_values = np.linspace(-maximum_rotation, maximum_rotation, 5)
+        angle_values = np.unique(np.concatenate((angle_values, [projected.angle])))
+
+    coarse_hypotheses = []
+    for scale in scale_values:
+        for angle in angle_values:
+            zero_translation = Similarity(float(scale), float(angle), 0.0, 0.0)
+            candidate_canvas = _warp_candidate_canvas(
+                candidate_uint8, zero_translation, cover_fit, (query_width, query_height),
+                coarse_scale, coarse_output,
+            )
+            intersections = cv2.matchTemplate(
+                padded_query, candidate_canvas, cv2.TM_CCORR
+            )
+            inside = cv2.matchTemplate(
+                padded_ones, candidate_canvas, cv2.TM_CCORR
+            )
+            denominator = query_area + inside - intersections
+            ious = np.divide(
+                intersections, denominator, out=np.full_like(intersections, -1.0),
+                where=denominator > 0,
+            )
+            ious[~disc] = -1.0
+            keep = min(2, ious.size)
+            flat_indices = np.argpartition(ious.ravel(), -keep)[-keep:]
+            for index in flat_indices:
+                row, column = np.unravel_index(index, ious.shape)
+                score = float(ious[row, column])
+                if score < 0.0:
+                    continue
+                coarse_hypotheses.append(
+                    (
+                        score,
+                        Similarity(
+                            float(scale), float(angle),
+                            (column - translation_radius) / coarse_scale,
+                            (row - translation_radius) / coarse_scale,
+                        ),
+                    )
                 )
-                iou = _warp_iou(q_mask, c_mask, candidate, cover_fit)
-                if iou > best_iou:
-                    best_iou = iou
-                    best_transform = candidate
+
+    coarse_hypotheses.sort(key=lambda item: item[0], reverse=True)
+    # Refine the best two correlation hypotheses at the normal 160px raster.
+    best_iou = -1.0
+    best_transform = projected
+    scale_step = float(np.min(np.diff(scale_values))) if len(scale_values) > 1 else 0.0
+    angle_step = maximum_rotation / 4.0 if maximum_rotation else 0.0
+    refine_scale = min(1.0, 160.0 / max(query_height, query_width))
+    refine_output = (
+        max(1, int(round(query_width * refine_scale))),
+        max(1, int(round(query_height * refine_scale))),
+    )
+    refine_query = cv2.resize(
+        q_mask.astype(np.uint8), refine_output, interpolation=cv2.INTER_NEAREST
+    )
+    translation_step = 1.0 / refine_scale
+    seeds = [item[1] for item in coarse_hypotheses[:2]] or [projected]
+    for seed in seeds:
+        for scale_delta in (-scale_step / 2.0, 0.0, scale_step / 2.0):
+            for angle_delta in (-angle_step / 2.0, 0.0, angle_step / 2.0):
+                for dx in (-translation_step, 0.0, translation_step):
+                    for dy in (-translation_step, 0.0, translation_step):
+                        candidate = _clip_transform(
+                            Similarity(
+                                seed.scale + scale_delta,
+                                seed.angle + angle_delta,
+                                seed.tx + dx,
+                                seed.ty + dy,
+                            ),
+                            limits,
+                            query_width,
+                        )
+                        iou = _iou_from_query_small(
+                            refine_query, candidate_uint8, candidate, cover_fit,
+                            refine_scale, refine_output, (query_width, query_height),
+                        )
+                        if iou > best_iou:
+                            best_iou = iou
+                            best_transform = candidate
     return MatchResult(
         iou=float(best_iou),
         cost=_cost(best_transform, (query_width, q_mask.shape[0])),
