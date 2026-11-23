@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import colorsys
 import json
 import time
 from pathlib import Path
@@ -23,7 +24,7 @@ def draw_detection_overlay(image: np.ndarray, detections: Sequence[Detection], a
     if base.ndim != 3 or base.shape[2] != 3:
         raise ValueError("image must be an RGB array")
     overlay = base.astype(np.float32)
-    colors = np.asarray([(230, 80, 60), (55, 150, 235), (80, 190, 105), (225, 165, 45), (175, 95, 210), (35, 185, 185)], dtype=np.float32)
+    colors = _palette(len(detections))
     for index, det in enumerate(detections):
         mask = np.asarray(det.mask, dtype=bool)
         if mask.shape != base.shape[:2]:
@@ -45,8 +46,18 @@ def draw_detection_overlay(image: np.ndarray, detections: Sequence[Detection], a
     return out
 
 
+def _palette(count: int) -> np.ndarray:
+    """Generate well-spaced deterministic colours for an arbitrary object count."""
+
+    if count <= 0:
+        return np.empty((0, 3), dtype=np.float32)
+    golden_ratio = 0.618033988749895
+    colours = [colorsys.hsv_to_rgb((index * golden_ratio) % 1.0, 0.78, 0.95) for index in range(count)]
+    return np.asarray(colours, dtype=np.float32) * 255.0
+
+
 def render_sheet(image: np.ndarray, methods: Mapping[str, Sequence[Detection]]) -> np.ndarray:
-    """Render original image beside one overlay per method."""
+    """Render a labelled original-plus-method sheet with a header strip."""
 
     panels = [np.asarray(image, dtype=np.uint8)]
     labels = ["original"]
@@ -55,11 +66,14 @@ def render_sheet(image: np.ndarray, methods: Mapping[str, Sequence[Detection]]) 
         labels.append(f"{name} ({len(detections)})")
     height = max(panel.shape[0] for panel in panels)
     width = sum(panel.shape[1] for panel in panels)
-    canvas = Image.new("RGB", (width, height), "white")
+    header_height = 26
+    canvas = Image.new("RGB", (width, height + header_height), "white")
+    draw = ImageDraw.Draw(canvas)
     x = 0
     for panel, label in zip(panels, labels):
         pil_panel = Image.fromarray(panel)
-        canvas.paste(pil_panel, (x, 0))
+        canvas.paste(pil_panel, (x, header_height))
+        draw.text((x + 4, 6), label, fill=(0, 0, 0))
         x += panel.shape[1]
     return np.asarray(canvas)
 
@@ -81,10 +95,10 @@ def _area_stats(detections: list[list[Detection]], frame_hw: tuple[int, int]) ->
     return {key: float(value) for key, value in zip(("min", "p25", "median", "p75", "max"), np.quantile(fractions, [0, .25, .5, .75, 1]))}
 
 
-def _method_summary(detections: list[list[Detection]], times: list[float], area_stats: dict[str, float], peak_gpu_memory: int | None) -> dict:
-    counts = np.asarray([len(x) for x in detections], dtype=float)
+def _method_summary(counts: Sequence[int], times: Sequence[float], area_stats: dict[str, float], peak_gpu_memory: int | None) -> dict:
+    counts = np.asarray(counts, dtype=float)
     return {
-        "images": len(detections),
+        "images": len(counts),
         "total_seconds": float(sum(times)),
         "seconds_per_image": float(np.mean(times)) if times else 0.0,
         "objects_per_image": {"mean": float(counts.mean()) if len(counts) else 0.0, "median": float(np.median(counts)) if len(counts) else 0.0, "p90": float(np.quantile(counts, .9)) if len(counts) else 0.0},
@@ -103,42 +117,52 @@ def run(args: argparse.Namespace) -> None:
         rows = keyframes.iloc[rng.choice(len(keyframes), size=args.n, replace=False)].reset_index(drop=True)
     else:
         rows = keyframes.reset_index(drop=True)
-    images = [_load_image(library_root / str(row.path)) for row in rows.itertuples()]
+    image_paths = [library_root / str(row.path) for row in rows.itertuples()]
     segmenters = {"mask2former": PanopticSegmenter(device=args.device, cache_dir=paths.hf_cache), "sam2_auto": SamAutoSegmenter(device=args.device, cache_dir=paths.hf_cache)}
     out_dir = Path(args.out) if args.out else library_root / "bakeoff"
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "sheets").mkdir(exist_ok=True)
-    all_detections: dict[str, list[list[Detection]]] = {}
+    sheet_indices = set(range(min(args.sheets, len(image_paths))))
+    sheet_images: dict[int, np.ndarray] = {}
+    sheet_detections: dict[str, dict[int, list[Detection]]] = {}
     summary: dict[str, dict] = {}
     for method, segmenter in segmenters.items():
-        if images:
-            segmenter.segment([images[0]])  # warm-up, excluded from timings
+        if image_paths:
+            segmenter.segment([_load_image(image_paths[0])])  # warm-up, excluded from timings
         try:
             import torch
             torch.cuda.reset_peak_memory_stats(args.device)
         except (ImportError, RuntimeError):
             torch = None
-        detections: list[list[Detection]] = []
+        counts: list[int] = []
+        area_fractions: list[float] = []
         times: list[float] = []
-        for image in images:
+        method_sheet_detections: dict[int, list[Detection]] = {}
+        object_rows = []
+        for index, (row, image_path) in enumerate(zip(rows.itertuples(), image_paths)):
+            image = _load_image(image_path)
             start = time.perf_counter()
             raw = segmenter.segment([image])[0]
             times.append(time.perf_counter() - start)
             kept = filter_detections(raw, image.shape[:2], max_objects=args.max_objects)
-            detections.append(kept)
-        all_detections[method] = detections
-        peak = int(torch.cuda.max_memory_allocated(args.device)) if torch is not None and torch.cuda.is_available() else None
-        summary[method] = _method_summary(detections, times, _area_stats(detections, images[0].shape[:2]) if images else {}, peak)
-        object_rows = []
-        for row, image_dets in zip(rows.itertuples(), detections):
-            for det in image_dets:
+            counts.append(len(kept))
+            area_fractions.extend(float(det.mask.mean()) for det in kept)
+            if index in sheet_indices:
+                sheet_images[index] = image
+                method_sheet_detections[index] = kept
+            for det in kept:
                 ys, xs = np.nonzero(det.mask)
                 bbox = [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1] if len(xs) else [0, 0, 0, 0]
                 object_rows.append({"keyframe_id": str(row.keyframe_id), "method": method, "score": float(det.score), "label": det.label, "area_frac": float(det.mask.mean()), "bbox": bbox})
+        sheet_detections[method] = method_sheet_detections
+        peak = int(torch.cuda.max_memory_allocated(args.device)) if torch is not None and torch.cuda.is_available() else None
+        area_stats = {key: float(value) for key, value in zip(("min", "p25", "median", "p75", "max"), np.quantile(area_fractions, [0, .25, .5, .75, 1]))} if area_fractions else {"min": 0.0, "p25": 0.0, "median": 0.0, "p75": 0.0, "max": 0.0}
+        summary[method] = _method_summary(counts, times, area_stats, peak)
         pd.DataFrame(object_rows, columns=["keyframe_id", "method", "score", "label", "area_frac", "bbox"]).to_parquet(out_dir / f"objects_{method}.parquet", index=False)
-    for index in range(min(args.sheets, len(images))):
-        methods = {name: detections[index] for name, detections in all_detections.items()}
-        Image.fromarray(render_sheet(images[index], methods)).save(out_dir / "sheets" / f"{index:04d}.jpg", quality=92)
+    for index in sorted(sheet_indices):
+        methods = {name: detections.get(index, []) for name, detections in sheet_detections.items()}
+        keyframe_id = str(rows.iloc[index]["keyframe_id"]).replace("/", "_")
+        Image.fromarray(render_sheet(sheet_images[index], methods)).save(out_dir / "sheets" / f"{keyframe_id}.jpg", quality=92)
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
 
 

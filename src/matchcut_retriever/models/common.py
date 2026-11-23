@@ -100,6 +100,8 @@ def mask_nms(masks: np.ndarray, scores: np.ndarray, iou_threshold: float) -> np.
         raise ValueError("masks and scores must have the same length")
     if not 0 <= iou_threshold <= 1:
         raise ValueError("iou_threshold must be in [0, 1]")
+    if len(masks_arr) == 0:
+        return np.empty(0, dtype=np.int64)
     order = np.argsort(-scores_arr, kind="stable")
     areas = masks_arr.reshape(len(masks_arr), -1).sum(axis=1).astype(np.float64)
     kept: list[int] = []
