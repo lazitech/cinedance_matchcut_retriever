@@ -65,17 +65,20 @@ def render_results(query_image, query_mask, results, library, out_path):
         overlay = _outline(overlay, warped_mask, (255, 70, 60))
         canvas[y0:y0 + panel_h, panel_w:panel_w * 2] = candidate_panel
         canvas[y0:y0 + panel_h, panel_w * 2:] = _fit(overlay, (panel_w, panel_h))
-        label = f"#{rank} {result.clip_id} shot {result.shot_no}"
+        # Two caption lines so the text fits the two result columns; the full
+        # clip id is in results.json.
+        where = f"#{rank} {result.clip_id[:13]}… shot {result.shot_no}"
         if result.start_s is not None and result.end_s is not None:
-            label += f" [{result.start_s:.2f}-{result.end_s:.2f}s]"
-        label += f"  score {result.final_score:.3f}  IoU {result.iou:.3f}  cost {result.transform_cost:.3f}"
+            where += f" [{result.start_s:.2f}-{result.end_s:.2f}s]"
+        scores = f"score {result.final_score:.3f}  IoU {result.iou:.3f}  cost {result.transform_cost:.3f}"
         if result.clip_cosine is not None:
-            label += f"  CLIP {result.clip_cosine:.3f}"
-        labels.append((y0, label))
+            scores += f"  CLIP {result.clip_cosine:.3f}"
+        labels.append((y0, where, scores))
     pil_canvas = Image.fromarray(canvas)
     draw = ImageDraw.Draw(pil_canvas)
-    for y0, label in labels:
-        draw.text((panel_w + 8, y0 + panel_h + 7), label, fill=(240, 240, 240), font=_font(17))
+    for y0, where, scores in labels:
+        draw.text((panel_w + 8, y0 + panel_h + 6), where, fill=(240, 240, 240), font=_font(16))
+        draw.text((panel_w + 8, y0 + panel_h + 30), scores, fill=(200, 200, 200), font=_font(16))
     draw.text((10, 3), "Query", fill=(240, 240, 240), font=_font(20))
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
