@@ -252,6 +252,19 @@ def test_cli_pool_flags_are_independent():
     assert args.coarse_n == 7 and args.hard_coarse_n == 9 and args.workers == 2
 
 
+def test_cli_explicit_missing_paths_config_raises(library, tmp_path):
+    image_path = tmp_path / "query.jpg"
+    mask_path = tmp_path / "mask.png"
+    Image.fromarray(np.zeros((80, 120, 3), np.uint8)).save(image_path)
+    Image.fromarray((Library.load(library).mask(0) * 255).astype(np.uint8)).save(mask_path)
+    with pytest.raises(FileNotFoundError):
+        query_main([
+            "--image", str(image_path), "--x", "60", "--y", "40", "--prepared",
+            "--mask", str(mask_path), "--no-clip", "--config", str(tmp_path / "missing.toml"),
+            "--out", str(tmp_path / "out"), "--library-root", str(library),
+        ])
+
+
 def test_framing_transform_maps_click_and_mask(monkeypatch):
     class Transform:
         crop = (20, 10, 180, 90)

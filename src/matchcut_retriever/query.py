@@ -108,7 +108,7 @@ def main(argv=None):
     try:
         paths = load_paths(args.config)
     except FileNotFoundError:
-        if not args.library_root:
+        if args.config is not None or not args.library_root:
             raise
         paths = None
     config = load_retrieval_config(args.retrieval_config)
