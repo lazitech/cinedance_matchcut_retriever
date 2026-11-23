@@ -24,12 +24,13 @@ class ClipEmbedder:
     def __init__(self, model_id: str = "openai/clip-vit-large-patch14", device: str = "cuda", cache_dir=None, batch_size: int = 64):
         torch, transformers = _require_gpu()
         self._torch = torch
+        self.model_id = str(model_id)
         self.device = device
         self.batch_size = int(batch_size)
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        self.processor = transformers.CLIPProcessor.from_pretrained(model_id, cache_dir=cache_dir)
-        self.model = transformers.CLIPModel.from_pretrained(model_id, cache_dir=cache_dir).to(device).eval()
+        self.processor = transformers.CLIPProcessor.from_pretrained(self.model_id, cache_dir=cache_dir)
+        self.model = transformers.CLIPModel.from_pretrained(self.model_id, cache_dir=cache_dir).to(device).eval()
 
     @staticmethod
     def prepare_masked_crop(image: np.ndarray, mask: np.ndarray, pad: float = 0.1, fill: tuple[int, int, int] = (127, 127, 127), size: int = 224) -> np.ndarray:

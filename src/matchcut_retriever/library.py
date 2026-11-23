@@ -154,6 +154,18 @@ def _clip_list(path: Path) -> list[str]:
     return [line.strip() for line in path.read_text().splitlines() if line.strip()]
 
 
+def _model_id(model: Any) -> str:
+    return str(getattr(model, "model_id", getattr(model, "name", model.__class__.__name__)))
+
+
+def _model_params(model: Any) -> dict[str, Any]:
+    params = getattr(model, "params", None)
+    if isinstance(params, dict):
+        return dict(params)
+    keys = ("device", "batch_size", "points_per_side", "pred_iou_thresh", "stability_thresh", "nms_iou", "points_per_batch")
+    return {key: getattr(model, key) for key in keys if hasattr(model, key)}
+
+
 def _append_marker(path: Path, clip_id: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as fh:
@@ -198,7 +210,7 @@ class LibraryBuilder:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def _processed(self) -> set[str]:
-        marker = self.root / "processed_clips.txt"
+        marker = self.root / "objects_processed.txt"
         return set(_clip_list(marker)) if marker.exists() else set()
 
     def _segment(self, images: list[np.ndarray]) -> list[list[Detection]]:
@@ -221,6 +233,14 @@ class LibraryBuilder:
             else:
                 merged.append(merge_detections(per_image[0][i], [d for outputs in per_image[1:] for d in outputs[i]]))
         return merged
+
+    def _metadata(self) -> dict[str, Any]:
+        return {
+            "clip_model": _model_id(self.embedder),
+            "segmenter_ids": [_model_id(segmenter) for segmenter in self.segmenters],
+            "segmenter_params": {_model_id(segmenter): _model_params(segmenter) for segmenter in self.segmenters},
+            "fingerprint_version": 1,
+        }
 
     def _write_part(self, clip_id: str, rows: list[dict[str, Any]], masks: list[np.ndarray], images: list[np.ndarray]) -> None:
         parts = self.root / "parts"
@@ -261,6 +281,7 @@ class LibraryBuilder:
             norms = np.linalg.norm(emb, axis=1, keepdims=True)
             emb = np.divide(emb, norms, out=np.zeros_like(emb), where=norms > 0)
             np.save(temp / "clip_emb.npy", emb.astype(np.float16))
+            (temp / "meta.json").write_text(json.dumps(self._metadata(), sort_keys=True))
             os.replace(temp, final)
         except Exception:
             shutil.rmtree(temp, ignore_errors=True)
@@ -273,7 +294,9 @@ class LibraryBuilder:
         table = pd.read_parquet(keyframes_path)
         parts = self.root / "parts"
         parts.mkdir(parents=True, exist_ok=True)
+        clip_ids = [str(clip_id) for clip_id in clip_ids]
         done = self._processed()
+        started = time.monotonic()
         summary = {"clips": 0, "keyframes": 0, "skipped_keyframes": 0, "objects": 0}
         for clip_id in clip_ids:
             cid = str(clip_id)
@@ -282,7 +305,7 @@ class LibraryBuilder:
             if (parts / cid / "objects.parquet").is_file():
                 # Recover a complete part if a process crashed after its
                 # atomic rename but before updating the marker file.
-                _append_marker(self.root / "processed_clips.txt", cid)
+                _append_marker(self.root / "objects_processed.txt", cid)
                 done.add(cid)
                 continue
             rows = table[table["clip_id"].astype(str) == cid].sort_values("keyframe_id")
@@ -313,10 +336,17 @@ class LibraryBuilder:
                 object_masks.extend(built_masks)
                 object_images.extend([image] * len(built_masks))
             self._write_part(cid, object_rows, object_masks, object_images)
-            _append_marker(self.root / "processed_clips.txt", cid)
+            _append_marker(self.root / "objects_processed.txt", cid)
             summary["clips"] += 1
             summary["keyframes"] += len(usable_images)
             summary["objects"] += len(object_rows)
+            elapsed = max(time.monotonic() - started, 1e-9)
+            LOG.info(
+                "library clips %d/%d (%.2f clips/s): %s objects=%d objects/keyframe=%.2f skipped_keyframes=%d",
+                summary["clips"], len(clip_ids), summary["clips"] / elapsed, cid,
+                len(object_rows), len(object_rows) / len(usable_images) if usable_images else 0.0,
+                summary["skipped_keyframes"],
+            )
         return summary
 
 
@@ -341,9 +371,13 @@ def _cast_objects(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def consolidate(root) -> pd.DataFrame:
-    """Concatenate committed clip parts and validate the resulting index."""
+    """Concatenate committed clip parts and validate the resulting index.
+
+    Part masks are copied as a stream and offsets are calculated with NumPy so
+    consolidation does not create one Python object per mask.
+    """
     root = Path(root)
-    marker = root / "processed_clips.txt"
+    marker = root / "objects_processed.txt"
     ids: list[str] = []
     seen: set[str] = set()
     if marker.exists():
@@ -351,36 +385,68 @@ def consolidate(root) -> pd.DataFrame:
             if cid not in seen:
                 ids.append(cid)
                 seen.add(cid)
-    all_rows: list[dict[str, Any]] = []
+    # A crash can leave a fully renamed part before its marker line is
+    # appended. Include such orphan parts in canonical clips.txt order so a
+    # consolidate call recovers them without rerunning segmentation.
+    part_root = root / "parts"
+    orphan_parts = {
+        path.name for path in part_root.iterdir()
+        if path.is_dir() and (path / "objects.parquet").is_file() and path.name not in seen
+    } if part_root.is_dir() else set()
+    if orphan_parts:
+        clip_order = _clip_list(root / "clips.txt") if (root / "clips.txt").is_file() else []
+        ordered_orphans = [cid for cid in clip_order if cid in orphan_parts]
+        ordered_orphans.extend(sorted(orphan_parts.difference(ordered_orphans)))
+        ids.extend(ordered_orphans)
+        seen.update(ordered_orphans)
+    all_frames: list[pd.DataFrame] = []
     all_fp: list[np.ndarray] = []
     all_emb: list[np.ndarray] = []
-    blob = bytearray()
     segments: set[str] = set()
+    segmenter_params: dict[str, Any] = {}
+    clip_models: set[str] = set()
+    fingerprint_versions: set[int] = set()
+    total_objects = 0
+    total_mask_bytes = 0
+    temp = _temp_dir(root, ".consolidate-")
     for cid in ids:
         part_dir = root / "parts" / cid
         if not (part_dir / "objects.parquet").is_file():
             continue
         part = pd.read_parquet(part_dir / "objects.parquet")
-        data = (part_dir / "masks.bin").read_bytes()
-        fp = np.asarray(np.load(part_dir / "shape_fp.npy"))
-        emb = np.asarray(np.load(part_dir / "clip_emb.npy"))
+        nbytes = part["mask_nbytes"].to_numpy(dtype=np.int64, copy=False) if len(part) else np.empty(0, dtype=np.int64)
+        if np.any(nbytes < 0):
+            raise ValueError(f"part {cid} has negative mask sizes")
+        local_offsets = np.zeros(len(part), dtype=np.int64)
+        if len(part) > 1:
+            local_offsets[1:] = np.cumsum(nbytes[:-1], dtype=np.int64)
+        mask_path = part_dir / "masks.bin"
+        part_bytes = mask_path.stat().st_size
+        if int(nbytes.sum(dtype=np.int64)) != part_bytes:
+            raise ValueError(f"part {cid} mask lengths disagree with masks.bin")
+        fp = np.asarray(np.load(part_dir / "shape_fp.npy", mmap_mode="r"))
+        emb = np.asarray(np.load(part_dir / "clip_emb.npy", mmap_mode="r"))
         if len(part) != len(fp) or len(part) != len(emb):
             raise ValueError(f"part {cid} array lengths disagree")
-        local_offset = 0
-        for _, record in part.iterrows():
-            nbytes = int(record["mask_nbytes"])
-            if local_offset < 0 or nbytes < 0 or local_offset + nbytes > len(data):
-                raise ValueError(f"part {cid} has invalid mask offsets")
-            row = record.to_dict()
-            row["object_id"] = len(all_rows)
-            row["mask_offset"] = len(blob)
-            blob.extend(data[local_offset:local_offset + nbytes])
-            local_offset += nbytes
-            segments.add(str(row.get("segmenter", "unknown")))
-            all_rows.append(row)
+        part = part.copy()
+        part.insert(0, "object_id", np.arange(total_objects, total_objects + len(part), dtype=np.int64))
+        part["mask_offset"] = total_mask_bytes + local_offsets
+        all_frames.append(part)
+        total_objects += len(part)
+        total_mask_bytes += part_bytes
         all_fp.append(fp.astype(np.float16, copy=False))
         all_emb.append(emb.astype(np.float16, copy=False))
-    output = _cast_objects(pd.DataFrame(all_rows))
+        sidecar = part_dir / "meta.json"
+        if sidecar.is_file():
+            info = json.loads(sidecar.read_text())
+            clip_models.add(str(info.get("clip_model", "clip")))
+            segments.update(str(value) for value in info.get("segmenter_ids", []))
+            segmenter_params.update(info.get("segmenter_params", {}))
+            if "fingerprint_version" in info:
+                fingerprint_versions.add(int(info["fingerprint_version"]))
+        else:
+            segments.update(str(value) for value in part["segmenter"].dropna().unique())
+    output = _cast_objects(pd.concat(all_frames, ignore_index=True) if all_frames else pd.DataFrame())
     fingerprints = np.concatenate(all_fp, axis=0) if all_fp else np.empty((0, FINGERPRINT_DIM), dtype=np.float16)
     if fingerprints.ndim != 2 or fingerprints.shape != (len(output), FINGERPRINT_DIM):
         raise ValueError("shape fingerprint array has the wrong shape")
@@ -396,25 +462,43 @@ def consolidate(root) -> pd.DataFrame:
         clip_embeddings = np.empty((0, 0), dtype=np.float16)
     if len(clip_embeddings) != len(output):
         raise ValueError("CLIP array length disagrees with objects")
-    for record in output.itertuples(index=False):
-        start = int(record.mask_offset)
-        encoded = bytes(blob[start:start + int(record.mask_nbytes)])
-        decoded = rle_decode(encoded)
-        if decoded.shape != (int(record.frame_h), int(record.frame_w)):
-            raise ValueError(f"mask shape mismatch for object {record.object_id}")
-
-    temp = _temp_dir(root, ".consolidate-")
     try:
         index = temp / "index"
         index.mkdir()
+        mask_output = index / "masks.bin"
+        with mask_output.open("wb") as destination:
+            for cid in ids:
+                part_mask = root / "parts" / cid / "masks.bin"
+                if not part_mask.is_file():
+                    continue
+                with part_mask.open("rb") as source:
+                    while True:
+                        chunk = source.read(8 * 1024 * 1024)
+                        if not chunk:
+                            break
+                        destination.write(chunk)
+        # Validate a deterministic bounded sample after all offsets have been
+        # rebased. Full length and range validation happened above.
+        if len(output):
+            rng = np.random.default_rng(0)
+            sample = rng.choice(len(output), size=min(1000, len(output)), replace=False)
+            with mask_output.open("rb") as source:
+                for index_value in np.sort(sample):
+                    record = output.iloc[int(index_value)]
+                    source.seek(int(record.mask_offset))
+                    encoded = source.read(int(record.mask_nbytes))
+                    decoded = rle_decode(encoded)
+                    if decoded.shape != (int(record.frame_h), int(record.frame_w)):
+                        raise ValueError(f"mask shape mismatch for object {record.object_id}")
         output.to_parquet(temp / "objects.parquet", index=False)
-        (index / "masks.bin").write_bytes(blob)
         np.save(index / "shape_fp.npy", fingerprints)
         np.save(index / "clip_emb.npy", clip_embeddings)
         meta = {
             "n_objects": int(len(output)), "segmenter": ",".join(sorted(segments)),
-            "segmenter_params": {}, "clip_model": "clip", "clip_dim": int(clip_dim),
-            "fingerprint_dim": int(FINGERPRINT_DIM), "fingerprint_version": 1,
+            "segmenter_params": segmenter_params,
+            "clip_model": ",".join(sorted(clip_models)) if clip_models else "clip",
+            "clip_dim": int(clip_dim),
+            "fingerprint_dim": int(FINGERPRINT_DIM), "fingerprint_version": (next(iter(fingerprint_versions)) if len(fingerprint_versions) == 1 else 1),
             "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), "clips": ids,
         }
         (index / "meta.json").write_text(json.dumps(meta, indent=2, sort_keys=True))
@@ -424,6 +508,8 @@ def consolidate(root) -> pd.DataFrame:
         final_index.mkdir(exist_ok=True)
         for name in ("masks.bin", "shape_fp.npy", "clip_emb.npy", "meta.json"):
             os.replace(index / name, final_index / name)
+        for cid in orphan_parts:
+            _append_marker(root / "objects_processed.txt", cid)
     finally:
         shutil.rmtree(temp, ignore_errors=True)
     return output
@@ -516,6 +602,7 @@ def main(argv: list[str] | None = None) -> int:
     stats = sub.add_parser("stats"); stats.add_argument("--config")
     neigh = sub.add_parser("neighbours"); neigh.add_argument("--n", type=int, default=12); neigh.add_argument("--k", type=int, default=8); neigh.add_argument("--seed", type=int, default=0); neigh.add_argument("--out"); neigh.add_argument("--config")
     args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     paths = load_paths(getattr(args, "config", None))
     root = paths.library_root
     if args.command == "consolidate":
@@ -526,7 +613,7 @@ def main(argv: list[str] | None = None) -> int:
         neighbours(root, args.n, args.k, args.seed, args.out)
     else:
         clips = _clip_list(root / "clips.txt")
-        processed = set(_clip_list(root / "processed_clips.txt")) if (root / "processed_clips.txt").is_file() else set()
+        processed = set(_clip_list(root / "objects_processed.txt")) if (root / "objects_processed.txt").is_file() else set()
         if args.shard:
             try:
                 shard_i, shard_n = (int(x) for x in args.shard.split("/", 1))
@@ -550,6 +637,7 @@ def main(argv: list[str] | None = None) -> int:
         summary = LibraryBuilder(root, segmenters, embedder, args.max_objects).process_clips(clips)
         if not args.no_consolidate:
             consolidate(root)
+        summary.update(_summary(root))
         print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
 
