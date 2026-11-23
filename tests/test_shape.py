@@ -10,6 +10,9 @@ from matchcut_retriever.shape import (
     object_geometry,
     shape_fingerprint,
     hard_prefilter,
+    cover_fit_matrix,
+    _iou_from_small,
+    _warp_iou,
 )
 
 
@@ -111,3 +114,43 @@ def test_hard_match_deterministic_polygon_alignment():
     cv2.fillPoly(query, [np.array([[125, 50], [185, 60], [160, 130], [105, 115]])], 1)
     result = hard_match(query, candidate)
     assert result.iou >= 0.85
+
+
+def test_cached_iou_matches_warp_iou_for_different_aspect_ratios():
+    rng = np.random.default_rng(11)
+    query = rng.random((241, 377)) > 0.88
+    candidate = rng.random((199, 521)) > 0.91
+    query[120, 188] = True
+    candidate[99, 260] = True
+    query_wh = (query.shape[1], query.shape[0])
+    candidate_wh = (candidate.shape[1], candidate.shape[0])
+    cover_fit = cover_fit_matrix(candidate_wh, query_wh)
+    resize_scale = min(1.0, 160.0 / max(query.shape))
+    query_size = (
+        round(query.shape[1] * resize_scale),
+        round(query.shape[0] * resize_scale),
+    )
+    candidate_size = (
+        round(candidate.shape[1] * resize_scale),
+        round(candidate.shape[0] * resize_scale),
+    )
+    query_small = cv2.resize(query.astype(np.uint8), query_size, interpolation=cv2.INTER_NEAREST)
+    candidate_small = cv2.resize(
+        candidate.astype(np.uint8), candidate_size, interpolation=cv2.INTER_NEAREST
+    )
+    for transform in (
+        Similarity(0.82, -0.03, 12.0, -7.0),
+        Similarity(1.18, 0.04, -9.0, 8.0),
+    ):
+        full = _warp_iou(query, candidate, transform, cover_fit)
+        cached = _iou_from_small(
+            query_small,
+            candidate_small,
+            transform,
+            cover_fit,
+            resize_scale,
+            query_size,
+            query_wh,
+            candidate_wh,
+        )
+        assert abs(full - cached) <= 0.005

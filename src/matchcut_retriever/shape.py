@@ -283,48 +283,44 @@ def _warp_iou(query_mask, candidate_mask, transform, cover_fit, long_side=160):
     query_small = cv2.resize(
         query_mask.astype(np.uint8), output_size, interpolation=cv2.INTER_NEAREST
     )
-    return _iou_from_query_small(
-        query_small, candidate_mask, transform, cover_fit,
+    candidate_height, candidate_width = candidate_mask.shape
+    candidate_size = (
+        max(1, int(round(candidate_width * resize_scale))),
+        max(1, int(round(candidate_height * resize_scale))),
+    )
+    candidate_small = cv2.resize(
+        candidate_mask.astype(np.uint8), candidate_size, interpolation=cv2.INTER_NEAREST
+    )
+    return _iou_from_small(
+        query_small, candidate_small, transform, cover_fit,
         resize_scale, output_size, (query_width, query_height),
+        (candidate_width, candidate_height),
     )
-
-
-def _iou_from_query_small(
-    query_small, candidate_mask, transform, cover_fit, resize_scale, output_size, query_wh
-):
-    """Compute IoU with a cached query raster and a full candidate mask."""
-
-    transform_matrix = transform.matrix(query_wh)
-    homogeneous_cover = np.vstack((cover_fit, [0.0, 0.0, 1.0]))
-    homogeneous_transform = np.vstack((transform_matrix, [0.0, 0.0, 1.0]))
-    matrix = (homogeneous_transform @ homogeneous_cover)[:2]
-    matrix *= resize_scale
-    candidate_array = (
-        candidate_mask
-        if candidate_mask.dtype == np.uint8
-        else candidate_mask.astype(np.uint8)
-    )
-    candidate_small = cv2.warpAffine(
-        candidate_array, matrix, output_size,
-        flags=cv2.INTER_NEAREST, borderValue=0,
-    )
-    intersection = np.count_nonzero(query_small & candidate_small)
-    union = np.count_nonzero(query_small | candidate_small)
-    return float(intersection / union) if union else 1.0
 
 
 def _iou_from_small(
-    query_small, candidate_small, transform, cover_fit, resize_scale, output_size, query_wh
+    query_small, candidate_small, transform, cover_fit, resize_scale, output_size,
+    query_wh, candidate_wh,
 ):
     """Compute IoU from masks already resized by the same coordinate factor."""
 
-    transform_matrix = transform.matrix(query_wh)
-    homogeneous_cover = np.vstack((cover_fit, [0.0, 0.0, 1.0]))
-    homogeneous_transform = np.vstack((transform_matrix, [0.0, 0.0, 1.0]))
-    matrix = (homogeneous_transform @ homogeneous_cover)[:2]
-    # Source coordinates are candidate_small pixels, so the linear part is
-    # unchanged; only destination translation is expressed at small scale.
-    matrix[:, 2] *= resize_scale
+    query_width, query_height = query_wh
+    candidate_width, candidate_height = candidate_wh
+    query_small_height, query_small_width = query_small.shape
+    candidate_small_height, candidate_small_width = candidate_small.shape
+    query_scale = np.array([
+        [query_small_width / query_width, 0.0, 0.0],
+        [0.0, query_small_height / query_height, 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    candidate_inverse_scale = np.array([
+        [candidate_width / candidate_small_width, 0.0, 0.0],
+        [0.0, candidate_height / candidate_small_height, 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    transform_matrix = np.vstack((transform.matrix(query_wh), [0.0, 0.0, 1.0]))
+    cover_matrix = np.vstack((cover_fit, [0.0, 0.0, 1.0]))
+    matrix = (query_scale @ transform_matrix @ cover_matrix @ candidate_inverse_scale)[:2]
     candidate_small = cv2.warpAffine(
         candidate_small, matrix, output_size,
         flags=cv2.INTER_NEAREST, borderValue=0,
@@ -424,20 +420,33 @@ def _coarse_translations(centroid_translation, maximum) -> list[np.ndarray]:
 def _warp_candidate_canvas(
     candidate_mask, transform, cover_fit, query_wh, resize_scale, output_size
 ):
-    """Warp a full-resolution candidate directly onto a small query canvas."""
+    """Warp a resized candidate onto a resized query canvas."""
 
-    transform_matrix = transform.matrix(query_wh)
-    homogeneous_cover = np.vstack((cover_fit, [0.0, 0.0, 1.0]))
-    homogeneous_transform = np.vstack((transform_matrix, [0.0, 0.0, 1.0]))
-    matrix = (homogeneous_transform @ homogeneous_cover)[:2]
-    matrix *= resize_scale
-    candidate_array = (
-        candidate_mask
-        if candidate_mask.dtype == np.uint8
-        else candidate_mask.astype(np.uint8)
+    query_width, query_height = query_wh
+    candidate_height, candidate_width = candidate_mask.shape
+    candidate_size = (
+        max(1, int(round(candidate_width * resize_scale))),
+        max(1, int(round(candidate_height * resize_scale))),
     )
+    candidate_small = cv2.resize(
+        candidate_mask.astype(np.uint8), candidate_size, interpolation=cv2.INTER_NEAREST
+    )
+    query_small_height, query_small_width = output_size[1], output_size[0]
+    query_scale = np.array([
+        [query_small_width / query_width, 0.0, 0.0],
+        [0.0, query_small_height / query_height, 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    candidate_inverse_scale = np.array([
+        [candidate_width / candidate_size[0], 0.0, 0.0],
+        [0.0, candidate_height / candidate_size[1], 0.0],
+        [0.0, 0.0, 1.0],
+    ])
+    transform_matrix = np.vstack((transform.matrix(query_wh), [0.0, 0.0, 1.0]))
+    cover_matrix = np.vstack((cover_fit, [0.0, 0.0, 1.0]))
+    matrix = (query_scale @ transform_matrix @ cover_matrix @ candidate_inverse_scale)[:2]
     return cv2.warpAffine(
-        candidate_array, matrix, output_size,
+        candidate_small, matrix, output_size,
         flags=cv2.INTER_NEAREST, borderValue=0,
     )
 
@@ -449,6 +458,7 @@ def hard_match(q_mask, c_mask, limits=HardLimits()) -> MatchResult:
     ``within_limits`` flag refers to the unconstrained centroid/area/axis
     solution; candidates to exclude are the responsibility of
     :func:`hard_prefilter`.
+    Coarse-to-fine search can miss very narrow optima for extremely thin shapes.
     """
 
     query_height, query_width = q_mask.shape
@@ -572,6 +582,7 @@ def hard_match(q_mask, c_mask, limits=HardLimits()) -> MatchResult:
         current_iou = _iou_from_small(
             refine_query, refine_candidate, current, cover_fit,
             refine_scale, refine_output, (query_width, query_height),
+            (c_mask.shape[1], c_mask.shape[0]),
         )
         evaluations = 1
         scale_step = scale_factor
@@ -598,6 +609,7 @@ def hard_match(q_mask, c_mask, limits=HardLimits()) -> MatchResult:
                 iou = _iou_from_small(
                     refine_query, refine_candidate, candidate, cover_fit,
                     refine_scale, refine_output, (query_width, query_height),
+                    (c_mask.shape[1], c_mask.shape[0]),
                 )
                 evaluations += 1
                 if iou > best_move_iou:
