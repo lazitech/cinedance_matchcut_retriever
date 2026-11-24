@@ -97,6 +97,19 @@ def test_end_to_end_resume_and_shards(tmp_path):
     assert sh_summary["modes"]["gt"]["soft"]["recall"] == result["modes"]["gt"]["soft"]["recall"]
 
 
+def test_kmax_limits_supported_recall_cutoffs(tmp_path):
+    root = _build(tmp_path / "lib")
+    out = tmp_path / "k5"
+    summary = run_selftest(root, out, n=2, seed=9, mask_source="gt", modes=("soft",), k_max=5, device="cpu", workers=1)
+    records = [json.loads(line) for line in (out / "records.jsonl").read_text().splitlines()]
+    assert records and all(record["k_max"] == 5 for record in records)
+    recall = summary["modes"]["gt"]["soft"]["recall"]
+    assert recall["1"] is not None and recall["5"] is not None
+    assert recall["10"] is None and recall["50"] is None
+    markdown = (out / "summary.md").read_text()
+    assert "—" in markdown
+
+
 def test_fake_sam_candidate_selection(tmp_path):
     root = _build(tmp_path / "lib")
 

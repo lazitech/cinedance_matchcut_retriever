@@ -94,7 +94,6 @@ def perturb_image_mask(image: np.ndarray, mask: np.ndarray, params: dict[str, fl
             values["mask_area"] = int(warped_mask.sum())
             values["area_ratio"] = float(warped_mask.sum() / base_area)
             values["retries"] = attempt
-            values["retry_count"] = attempt
             return out, warped_mask, values
     raise RuntimeError("unable to draw a valid perturbation")
 
@@ -152,20 +151,39 @@ def _bucket(area_frac: float) -> str:
 def summarize_records(records: Iterable[dict[str, Any]], k_values: tuple[int, ...] = (1, 10, 50)) -> dict[str, Any]:
     records = list(records)
     summary: dict[str, Any] = {"n": len(records), "modes": {}, "sam": {}}
+    recorded_k = [int(record["k_max"]) for record in records if record.get("k_max") is not None]
+    supported_max = min(recorded_k) if recorded_k else max(k_values, default=0)
+    cutoffs = tuple(sorted(set(k_values) | ({supported_max} if recorded_k else set())))
     keys = sorted({(source, mode) for record in records for source, value in record.get("results", {}).items() for mode in value})
     for source, mode in keys:
         rows = [r for r in records if r.get("results", {}).get(source, {}).get(mode) is not None]
         hits = [r["results"][source][mode] for r in rows]
         ranks = [h["rank"] for h in hits]
         times = [float(h.get("timing_s", h.get("rank_time_s", h.get("time_s", 0.0)))) for h in hits]
-        recall = {str(k): sum(rank is not None and rank <= k for rank in ranks) / len(rows) if rows else 0.0 for k in k_values}
-        entry: dict[str, Any] = {"n": len(rows), "recall": recall, "recall_at_1": recall.get("1", 0.0), "recall_at_10": recall.get("10", 0.0), "recall_at_50": recall.get("50", 0.0), "median_rank_time_s": float(np.median(times)) if times else None}
+        recall = {
+            str(k): (sum(rank is not None and rank <= k for rank in ranks) / len(rows) if rows else 0.0)
+            if k <= supported_max else None
+            for k in cutoffs
+        }
+        exact_hits = sum(h.get("rank") is not None and bool(h.get("exact_object", False)) for h in hits)
+        hit_count = sum(h.get("rank") is not None for h in hits)
+        entry: dict[str, Any] = {"n": len(rows), "recall": recall, "recall_at_1": recall.get("1"), "recall_at_10": recall.get("10"), "recall_at_50": recall.get("50"), "exact_object_share": exact_hits / hit_count if hit_count else 0.0, "median_rank_time_s": float(np.median(times)) if times else None}
         entry.update({f"recall@{k}": value for k, value in recall.items()})
         for label, predicate in (("area", lambda r: _bucket(float(r.get("area_frac", 0.0)))), ("segmenter", lambda r: str(r.get("segmenter", "unknown")))):
             groups: dict[str, list[int | None]] = {}
             for r, h in zip(rows, hits):
                 groups.setdefault(predicate(r), []).append(h["rank"])
-            entry[label] = {name: {"n": len(vals), "recall": {str(k): sum(v is not None and v <= k for v in vals) / len(vals) if vals else 0.0 for k in k_values}} for name, vals in sorted(groups.items())}
+            entry[label] = {
+                name: {
+                    "n": len(vals),
+                    "recall": {
+                        str(k): (sum(v is not None and v <= k for v in vals) / len(vals) if vals else 0.0)
+                        if k <= supported_max else None
+                        for k in cutoffs
+                    },
+                }
+                for name, vals in sorted(groups.items())
+            }
         summary["modes"].setdefault(source, {})[mode] = entry
     sam_rows = [r.get("sam") for r in records if r.get("sam")]
     if sam_rows:
@@ -177,18 +195,20 @@ def summarize_records(records: Iterable[dict[str, Any]], k_values: tuple[int, ..
 
 
 def _markdown(summary: dict[str, Any]) -> str:
-    lines = ["# Match-cut retriever self-test", "", "| Mask source | Mode | n | Recall@1 | Recall@10 | Recall@50 | Median rank time (s) |", "|---|---:|---:|---:|---:|---:|---:|"]
+    lines = ["# Match-cut retriever self-test", "", "| Mask source | Mode | n | Recall@1 | Recall@10 | Recall@50 | Exact object | Median rank time (s) |", "|---|---:|---:|---:|---:|---:|---:|---:|"]
     for source, modes in summary.get("modes", {}).items():
         for mode, item in modes.items():
             recall = item["recall"]
-            lines.append(f"| {source} | {mode} | {item['n']} | {recall.get('1', 0):.3f} | {recall.get('10', 0):.3f} | {recall.get('50', 0):.3f} | {item['median_rank_time_s'] if item['median_rank_time_s'] is not None else '—'} |" )
+            fmt = lambda value: "—" if value is None else f"{value:.3f}"
+            median = "—" if item["median_rank_time_s"] is None else f"{item['median_rank_time_s']:.2f}"
+            lines.append(f"| {source} | {mode} | {item['n']} | {fmt(recall.get('1'))} | {fmt(recall.get('10'))} | {fmt(recall.get('50'))} | {item['exact_object_share']:.3f} | {median} |")
     for source, modes in summary.get("modes", {}).items():
         for mode, item in modes.items():
             lines += ["", f"### {source} / {mode} breakdown", "", "| Group | n | Recall@1 | Recall@10 | Recall@50 |", "|---|---:|---:|---:|---:|"]
             for label in ("area", "segmenter"):
                 for group, values in item.get(label, {}).items():
                     r = values["recall"]
-                    lines.append(f"| {label}={group} | {values['n']} | {r.get('1', 0):.3f} | {r.get('10', 0):.3f} | {r.get('50', 0):.3f} |")
+                    lines.append(f"| {label}={group} | {values['n']} | {fmt(r.get('1'))} | {fmt(r.get('10'))} | {fmt(r.get('50'))} |")
     if summary.get("sam", {}).get("n"):
         lines += ["", f"SAM: median best IoU {summary['sam']['median_best_iou']:.3f}; candidate 0 best share {summary['sam']['candidate_0_best_share']:.3f}."]
     if summary.get("failures"):
@@ -196,7 +216,7 @@ def _markdown(summary: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def run_selftest(library_root: str | Path, out: str | Path, n: int = 200, seed: int = 0, mask_source: str = "both", modes: Iterable[str] = ("soft", "hard"), k_max: int = 50, semantic: float = 0.0, config_path: str | Path | None = None, retrieval_config: str | Path | None = None, device: str = "cuda:0", workers: int | None = None, coarse_n: int | None = None, hard_coarse_n: int | None = None, shard: str | None = None, point_segmenter: Any = None, render_failures: int = 0) -> dict[str, Any]:
+def run_selftest(library_root: str | Path, out: str | Path, n: int = 200, seed: int = 0, mask_source: str = "both", modes: Iterable[str] = ("soft", "hard"), k_max: int = 50, semantic: float = 0.0, config_path: str | Path | None = None, retrieval_config: str | Path | None = None, device: str = "cuda:0", workers: int | None = None, coarse_n: int | None = None, hard_coarse_n: int | None = None, shard: str | None = None, point_segmenter: Any = None, embedder: Any = None, render_failures: int = 0) -> dict[str, Any]:
     """Run or resume the self-test and write summary.json/summary.md."""
     root, out = Path(library_root), Path(out)
     out.mkdir(parents=True, exist_ok=True)
@@ -220,12 +240,16 @@ def run_selftest(library_root: str | Path, out: str | Path, n: int = 200, seed: 
         from .models import SamPointSegmenter
         paths = load_paths(config_path)
         sam_model = SamPointSegmenter(device=device, cache_dir=paths.hf_cache)
+    if semantic and embedder is None:
+        from .models import ClipEmbedder
+        paths = load_paths(config_path)
+        embedder = ClipEmbedder(device=device, cache_dir=paths.hf_cache)
     with records_path.open("a", encoding="utf-8") as stream:
         for sample_index, object_id in enumerate(sample_object_ids(library.objects, n, seed)):
             if sample_index % shard_count != shard_index or sample_index in existing:
                 continue
             row = library.objects.iloc[int(object_id)]
-            record: dict[str, Any] = {"sample_index": sample_index, "object_id": int(object_id), "clip_id": str(row.clip_id), "shot_no": int(row.shot_no), "keyframe_id": str(row.keyframe_id), "area_frac": float(row.area_frac), "segmenter": str(row.segmenter), "results": {}}
+            record: dict[str, Any] = {"sample_index": sample_index, "object_id": int(object_id), "clip_id": str(row.clip_id), "shot_no": int(row.shot_no), "keyframe_id": str(row.keyframe_id), "area_frac": float(row.area_frac), "segmenter": str(row.segmenter), "k_max": int(k_max), "results": {}}
             try:
                 image = np.asarray(Image.open(library.keyframe_path(row.keyframe_id)).convert("RGB"), dtype=np.uint8)
                 source_mask = library.mask(object_id)
@@ -249,9 +273,7 @@ def run_selftest(library_root: str | Path, out: str | Path, n: int = 200, seed: 
                     query_mask = masks[source]
                     clip_vector = None
                     if semantic:
-                        from .models import ClipEmbedder
-                        paths = load_paths(config_path)
-                        clip_vector = ClipEmbedder(device=device, cache_dir=paths.hf_cache).embed_masked([prepared], [query_mask])[0]
+                        clip_vector = embedder.embed_masked([prepared], [query_mask])[0]
                     query = QueryObject.from_mask(prepared, query_mask, clip_vector)
                     for mode in modes:
                         started = time.perf_counter()
@@ -305,4 +327,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
