@@ -35,9 +35,9 @@
 
 ### 3.1 视频
 
-- 位置：服务器 `/data0/lvanzhe/CineDance_01/video_live/<video_id>.mp4`。截至 2026-11-22 有约 11,464 个真人电影 clip（约 155 小时、305 GB），下载任务还在继续。
+- 位置：服务器 `/data0/lvanzhe/CineDance_01/video_live/<video_id>.mp4`。截至 2026-11-24 有 18,423 个真人电影 clip（约 250 小时、490 GB），来自 HF 分片 part0000–part0015。下载任务已于 2026-11-23 因 /data0 空间不足自动停止（剩约 115 GB），暂不继续。
 - 这个目录**只读**：不要在 `CineDance_01/` 里写任何东西，也不要干预 `meta/download_more.sh` 和 `split_shard_server.py`。
-- `video_review/`（mixed / uncertain，约 25 个）不入库。`*.part` 是正在写入的文件，跳过。
+- `video_review/`（mixed / uncertain，44 个）不入库。`*.part` 是正在写入的文件，跳过。
 - `manifest/*.tsv` 和 `meta/labels_v5.csv` 记录了每个 clip 来自哪个 shard、属于哪个标签。增量入库时用它们判断哪些 clip 是新的。
 - clip 格式：h264，23.976 / 24 / 25 fps，宽度多为 1920，**高度多为 436–982**，看起来黑边已经裁掉了。每个 clip 10–111 秒（中位数 44 秒），是**多镜头**的叙事片段。
 - 数据集是 CineDance-1M 的第 1 部分（[HF](https://huggingface.co/datasets/CineDance/CineDance_01)，[论文 arXiv 2606.09639](https://arxiv.org/abs/2606.09639)），HF 上是门控访问，许可证 **CC-BY-NC-SA**。
@@ -98,7 +98,7 @@ bakeoff/、eval/           实验输出
 
 ### 4.3 磁盘
 
-- `/data0` 只剩约 290 GB，而且下载任务还在写，所以我们的输出一律放 `/data2/lvanzhe/`。
+- `/data0` 只剩约 115 GB（使用率 99%），所以我们的输出一律放 `/data2/lvanzhe/`。
 - 大任务开始前先估算输出大小。
 
 ## 5. Git 工作流
