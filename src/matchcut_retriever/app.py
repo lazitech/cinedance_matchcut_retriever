@@ -225,7 +225,8 @@ def _result_gallery_item(engine, prepared, query_mask, result, rank: int):
         y, x = (height-small.shape[0])//2, (320-small.shape[1])//2
         out[y:y+small.shape[0], x:x+small.shape[1]] = small
         return out
-    panel = np.concatenate([fit(cand), fit(overlay)], axis=1)
+    # Stack vertically: Gradio gallery cells are square, so a wide strip wastes most of the cell.
+    panel = np.concatenate([fit(cand), fit(overlay)], axis=0)
     caption = f"#{rank} {result.clip_id[:12]}… shot {result.shot_no}"
     if result.start_s is not None and result.end_s is not None:
         caption += f" [{result.start_s:.2f}-{result.end_s:.2f}s]"
@@ -281,7 +282,7 @@ def build_app(engine: QueryEngine | None = None, **engine_kwargs):
                 max_rot = gr.Number(value=cfg.max_rot_deg, label="Max rotation (degrees)")
         search_btn = gr.Button("Search", variant="primary")
         timings = gr.Markdown()
-        gallery = gr.Gallery(label="Results", columns=2, height="auto", object_fit="contain", show_label=True)
+        gallery = gr.Gallery(label="Results (top: candidate shot, bottom: aligned overlay)", columns=4, height=900, object_fit="contain", show_label=True)
         breakdown = gr.JSON(label="Result breakdown")
         video = gr.Video(label="Shot clip", interactive=False)
         state = gr.State({"prepared": None, "items": []})

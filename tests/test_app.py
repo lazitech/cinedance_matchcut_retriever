@@ -188,3 +188,14 @@ def test_select_handlers_receive_gradio_event_data(tmp_path):
         args, *_ = special_args(handlers[name], inputs, None, event)
         assert isinstance(args[-1], gr.SelectData), name
         assert list(args[-1].index) == [12, 34]
+
+
+def test_gallery_panel_stacks_candidate_over_overlay(tmp_path):
+    engine = _engine(tmp_path)
+    image = np.full((80, 100, 3), 128, dtype=np.uint8)
+    mask = np.zeros((80, 100), dtype=bool)
+    mask[40:56, 50:70] = True
+    results, _, _ = engine.search(image, mask, mode="soft", semantic=0.0, k=5)
+    panel, caption = app_module._result_gallery_item(engine, image, mask, results[0], 1)
+    assert panel.shape == (440, 320, 3)
+    assert caption.startswith("#1 ")
