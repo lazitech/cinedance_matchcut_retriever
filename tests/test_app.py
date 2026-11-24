@@ -159,3 +159,12 @@ def test_main_configures_and_launches_app(monkeypatch):
     assert calls["build"]["library_root"] == "/tmp/library"
     assert calls["queued"] is True
     assert calls["launch"] == {"server_name": "0.0.0.0", "server_port": 8123, "share": True}
+
+
+def test_gradio_temp_dir_defaults_to_per_user_folder(tmp_path, monkeypatch):
+    monkeypatch.delenv("GRADIO_TEMP_DIR", raising=False)
+    monkeypatch.setattr(app_module.tempfile, "gettempdir", lambda: str(tmp_path))
+    path = Path(app_module._ensure_gradio_temp_dir())
+    assert path.parent == tmp_path and path.name.startswith("gradio-") and path.is_dir()
+    monkeypatch.setenv("GRADIO_TEMP_DIR", "/custom/dir")
+    assert app_module._ensure_gradio_temp_dir() == "/custom/dir"

@@ -230,8 +230,29 @@ def _result_gallery_item(engine, prepared, query_mask, result, rank: int):
     return panel, caption
 
 
+def _ensure_gradio_temp_dir() -> str:
+    """Point Gradio's upload dir at a per-user folder unless GRADIO_TEMP_DIR is set.
+
+    Gradio defaults to ``/tmp/gradio``; on a shared host another user may own it and every
+    upload then fails with a permission error. Gradio reads the variable at import time, so
+    this must run before ``import gradio``.
+    """
+    current = os.environ.get("GRADIO_TEMP_DIR")
+    if current:
+        return current
+    try:
+        user = str(os.getuid())
+    except AttributeError:  # pragma: no cover - non-POSIX
+        user = os.environ.get("USERNAME", "user")
+    path = Path(tempfile.gettempdir()) / f"gradio-{user}"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.environ["GRADIO_TEMP_DIR"] = str(path)
+    return str(path)
+
+
 def build_app(engine: QueryEngine | None = None, **engine_kwargs):
     """Construct the Gradio Blocks application without launching a server."""
+    _ensure_gradio_temp_dir()
     import gradio as gr
     if engine is None:
         engine = QueryEngine(**engine_kwargs)
