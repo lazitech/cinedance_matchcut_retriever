@@ -9,8 +9,8 @@ Status: stage 0 (repo and environment). The design and roadmap are in `CLAUDE.md
 ## Setup
 
 ```bash
-uv sync                      # CPU deps + pytest
-uv sync --extra gpu          # on the GPU server
+uv sync --extra app          # local CPU UI (no model dependencies)
+uv sync --extra gpu --extra app  # server UI with model dependencies
 cp configs/local.example.toml configs/local.toml   # then edit paths
 uv run pytest
 ```
@@ -22,3 +22,24 @@ On a host that cannot reach GitHub, wrap network commands with the temporary pro
 
 Uses CineDance-1M (gated, CC-BY-NC-SA). No video, frames, masks, annotations or features are
 committed to this repository.
+
+## Gradio UI
+
+After building or obtaining a retrieval library, launch the local query interface with:
+
+```bash
+uv sync --extra app
+.venv/bin/python -m matchcut_retriever.app --config configs/local.toml
+```
+
+The interface opens at `http://127.0.0.1:7860`. Upload an image, click the subject, choose a
+SAM mask, adjust ranking controls, and press **Search**. To expose a temporary public share link
+from the server, run the proxy wrapper:
+
+```bash
+uv sync --extra gpu --extra app
+python3 scripts/proxy_run.py -- .venv/bin/python -m matchcut_retriever.app --config configs/local.toml --share
+```
+
+The proxy is temporary and stays up only while the wrapped app process is running; stop the app
+to stop the proxy.
