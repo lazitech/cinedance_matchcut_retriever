@@ -6,6 +6,7 @@ import pandas as pd
 from pathlib import Path
 
 from matchcut_retriever.app import QueryEngine
+import matchcut_retriever.app as app_module
 from matchcut_retriever.models import Detection
 from matchcut_retriever.library import LibraryBuilder, consolidate
 from matchcut_retriever.config import Paths
@@ -70,6 +71,31 @@ def test_search_merges_per_shot_and_caches_semantic_query(tmp_path):
     assert clip.calls == 1
 
 
+def test_clip_cache_key_includes_shape_and_dtype(tmp_path):
+    clip = CountingClip()
+    engine = _engine(tmp_path, clip=clip)
+    image = np.full((8, 12, 3), 128, dtype=np.uint8)
+    mask = np.zeros((8, 12), dtype=bool)
+    mask[2:6, 3:8] = True
+    engine._clip_vector(image, mask)
+    # Same bytes with a different image shape must not reuse the first entry.
+    image_reshaped = image.reshape(4, 24, 3)
+    mask_reshaped = mask.reshape(4, 24)
+    engine._clip_vector(image_reshaped, mask_reshaped)
+    assert clip.calls == 2
+
+
+def test_library_root_override_still_loads_machine_paths(tmp_path, monkeypatch):
+    root = _make_root(tmp_path, clips=("a",), frames_per_clip=1)
+    LibraryBuilder(root, [FakeSegmenter("sam2_auto")], FakeEmbedder()).process_clips(["a"])
+    consolidate(root)
+    expected = Paths(tmp_path / "videos", tmp_path, tmp_path, root, tmp_path / "hf")
+    monkeypatch.setattr("matchcut_retriever.app.load_paths", lambda config=None: expected)
+    engine = QueryEngine(library_root=root, sam=FakeSam(), clip=CountingClip())
+    assert engine.paths == expected
+    assert engine.last_message is None
+
+
 def test_search_reports_tiny_mask_warning(tmp_path):
     engine = _engine(tmp_path)
     image = np.full((80, 100, 3), 128, dtype=np.uint8)
@@ -108,3 +134,25 @@ def test_build_app_with_injected_engine_does_not_launch(tmp_path):
     engine = _engine(tmp_path)
     app = build_app(engine)
     assert app is not None
+
+
+def test_main_configures_and_launches_app(monkeypatch):
+    calls = {}
+
+    class FakeApp:
+        def queue(self):
+            calls["queued"] = True
+            return self
+
+        def launch(self, **kwargs):
+            calls["launch"] = kwargs
+
+    def fake_build_app(**kwargs):
+        calls["build"] = kwargs
+        return FakeApp()
+
+    monkeypatch.setattr(app_module, "build_app", fake_build_app)
+    assert app_module.main(["--library-root", "/tmp/library", "--host", "0.0.0.0", "--port", "8123", "--share"]) == 0
+    assert calls["build"]["library_root"] == "/tmp/library"
+    assert calls["queued"] is True
+    assert calls["launch"] == {"server_name": "0.0.0.0", "server_port": 8123, "share": True}

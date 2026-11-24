@@ -9,8 +9,8 @@ Status: stage 0 (repo and environment). The design and roadmap are in `CLAUDE.md
 ## Setup
 
 ```bash
-uv sync                      # CPU deps + pytest
-uv sync --extra gpu          # on the GPU server
+uv sync --extra app          # local CPU UI (no model dependencies)
+uv sync --extra gpu --extra app  # server UI with model dependencies
 cp configs/local.example.toml configs/local.toml   # then edit paths
 uv run pytest
 ```
@@ -28,6 +28,7 @@ committed to this repository.
 After building or obtaining a retrieval library, launch the local query interface with:
 
 ```bash
+uv sync --extra app
 .venv/bin/python -m matchcut_retriever.app --config configs/local.toml
 ```
 
@@ -36,5 +37,9 @@ SAM mask, adjust ranking controls, and press **Search**. To expose a temporary p
 from the server, run the proxy wrapper:
 
 ```bash
+uv sync --extra gpu --extra app
 python3 scripts/proxy_run.py -- .venv/bin/python -m matchcut_retriever.app --config configs/local.toml --share
 ```
+
+The proxy is temporary and stays up only while the wrapped app process is running; stop the app
+to stop the proxy.

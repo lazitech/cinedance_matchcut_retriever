@@ -39,9 +39,17 @@ class QueryEngine:
     def __init__(self, library_root=None, config=None, retrieval_config=None,
                  device: str = "cpu", sam=None, clip=None, paths=None):
         self.device = device
+        self._path_message: str | None = None
         self.paths = paths
-        if paths is None and config is not None:
-            self.paths = load_paths(config)
+        if self.paths is None:
+            try:
+                # Resolve machine paths even when a library root override is
+                # supplied: video extraction and model caches still need them.
+                self.paths = load_paths(config)
+            except FileNotFoundError:
+                # Synthetic/test deployments may intentionally omit the local
+                # machine config. Keep the explicit library root usable.
+                self._path_message = "machine paths are not configured; video clips and model cache paths are unavailable"
         if library_root is None:
             if self.paths is None:
                 self.paths = load_paths(config)
@@ -52,8 +60,8 @@ class QueryEngine:
         self._sam = sam
         self._clip = clip
         self._lock = threading.RLock()
-        self._clip_cache: dict[tuple[str, str], np.ndarray] = {}
-        self.last_message: str | None = None
+        self._clip_cache: dict[tuple[tuple[int, ...], str, str, tuple[int, ...], str, str], np.ndarray] = {}
+        self.last_message: str | None = self._path_message
 
     @property
     def sam(self):
@@ -110,7 +118,10 @@ class QueryEngine:
     def _clip_vector(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
         image = np.asarray(image)
         mask = np.asarray(mask, dtype=bool)
-        key = (hashlib.sha1(image.tobytes()).hexdigest(), hashlib.sha1(mask.tobytes()).hexdigest())
+        key = (
+            tuple(image.shape), image.dtype.str, hashlib.sha1(image.tobytes()).hexdigest(),
+            tuple(mask.shape), mask.dtype.str, hashlib.sha1(mask.tobytes()).hexdigest(),
+        )
         with self._lock:
             value = self._clip_cache.get(key)
             if value is None:
@@ -181,7 +192,7 @@ class QueryEngine:
 __all__ = ["Candidate", "QueryEngine"]
 
 
-def _result_gallery_item(engine, prepared, query_mask, result):
+def _result_gallery_item(engine, prepared, query_mask, result, rank: int):
     """Build a compact candidate/overlay panel for the Gradio gallery."""
     import cv2
     from PIL import Image
@@ -210,7 +221,7 @@ def _result_gallery_item(engine, prepared, query_mask, result):
         out[y:y+small.shape[0], x:x+small.shape[1]] = small
         return out
     panel = np.concatenate([fit(cand), fit(overlay)], axis=1)
-    caption = f"#{result.clip_id[:12]}… shot {result.shot_no}"
+    caption = f"#{rank} {result.clip_id[:12]}… shot {result.shot_no}"
     if result.start_s is not None and result.end_s is not None:
         caption += f" [{result.start_s:.2f}-{result.end_s:.2f}s]"
     caption += f" score={result.final_score:.3f} IoU={result.iou:.3f} cost={result.transform_cost:.3f}"
@@ -279,7 +290,8 @@ def build_app(engine: QueryEngine | None = None, **engine_kwargs):
                 return [], "Click the query image first.", {}, None
             idx = int(str(choice).split(":", 1)[0]); item = st["items"][idx]
             results, t, warns = engine.search(st["prepared"], item["mask"], mode_value, semantic_value, int(k_value), min_s, max_s, trans, rot)
-            gallery_items = [_result_gallery_item(engine, st["prepared"], item["mask"], r) for r in results]
+            gallery_items = [_result_gallery_item(engine, st["prepared"], item["mask"], r, rank)
+                             for rank, r in enumerate(results, 1)]
             msg = "\n".join(f"⚠️ {w}" for w in warns) if warns else ""
             if t:
                 msg += ("\n" if msg else "") + "Timings: " + ", ".join(f"{key}={value:.3f}s" for key, value in t.items())
@@ -291,10 +303,20 @@ def build_app(engine: QueryEngine | None = None, **engine_kwargs):
             idx = evt.index[0] if isinstance(evt.index, (tuple, list)) else evt.index
             try:
                 result = result_list[int(idx)]
+            except (IndexError, TypeError, ValueError):
+                return {"error": "selected result is unavailable"}, None
+            breakdown = result.to_dict()
+            try:
                 path = engine.shot_video(result.clip_id, result.shot_no)
-                return result.to_dict(), path
-            except Exception:
-                return {}, None
+            except Exception as exc:
+                path = None
+                breakdown["error"] = str(exc)
+            if path is None:
+                breakdown["error"] = (
+                    getattr(engine, "last_message", None)
+                    or "unable to create the shot video"
+                )
+            return breakdown, path
 
         # Keep the click handler synchronous so Gradio preserves SelectData's
         # pixel index before the longer SAM call is queued.
@@ -322,3 +344,7 @@ def main(argv=None):
 
 
 __all__ = ["Candidate", "QueryEngine", "build_app", "main"]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
