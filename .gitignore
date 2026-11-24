@@ -34,3 +34,5 @@ hf_token*
 
 # Tooling
 .playwright-mcp/
+# Gradio share certificate and runtime files
+.gradio/
