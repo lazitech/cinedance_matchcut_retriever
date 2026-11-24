@@ -10,14 +10,15 @@ Status: stage 7 (Gradio UI) on the 500-clip development library. The design and 
 ## Setup
 
 ```bash
-uv sync                              # core deps + pytest (unit tests only)
-uv sync --extra gpu --extra app      # models (SAM, CLIP, Mask2Former) + Gradio UI
+uv sync                              # dev machine: core deps + pytest (unit tests only)
+uv sync --extra gpu --extra app      # GPU server: models (SAM, CLIP, Mask2Former) + Gradio UI
 cp configs/local.example.toml configs/local.toml   # then edit paths
 uv run pytest
 ```
 
-The `gpu` extra holds the model dependencies (torch, transformers); they also run on CPU, so the
-UI and the query CLI work without a GPU (`--device cpu`, slower). Building the library needs a GPU.
+Model inference (library builds, queries, the UI) runs on the GPU server only; the dev machine
+runs unit tests on synthetic data and views results. On the server, the UI and the query CLI can
+use the CPU (`--device cpu`, the default for the UI) so they need no GPU; building the library does.
 
 On a host that cannot reach GitHub, wrap network commands with the temporary proxy:
 `python3 scripts/proxy_run.py -- git push`.
@@ -29,8 +30,8 @@ committed to this repository.
 
 ## Gradio UI
 
-Queries load SAM and CLIP, so install both extras (`uv sync --extra gpu --extra app`). After
-building or obtaining a retrieval library, launch the query interface with:
+Queries load SAM and CLIP, so run the UI on the GPU server with both extras installed
+(`uv sync --extra gpu --extra app`). After building a retrieval library, launch it with:
 
 ```bash
 .venv/bin/python -m matchcut_retriever.app --config configs/local.toml   # --device cuda:0 for a GPU

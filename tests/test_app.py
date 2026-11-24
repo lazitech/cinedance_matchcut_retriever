@@ -131,6 +131,9 @@ def test_shot_video_is_cached_and_missing_source_is_reported(tmp_path):
 
 
 def test_build_app_with_injected_engine_does_not_launch(tmp_path):
+    import pytest
+
+    pytest.importorskip("gradio")  # optional `app` extra
     engine = _engine(tmp_path)
     app = build_app(engine)
     assert app is not None
