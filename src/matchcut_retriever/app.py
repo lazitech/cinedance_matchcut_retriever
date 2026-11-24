@@ -1,0 +1,324 @@
+"""Gradio application and UI-independent query engine."""
+from __future__ import annotations
+
+import hashlib
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import threading
+from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
+
+from .config import load_paths
+from .framing import prepare_image
+from .query import query_warnings
+from .retrieval import Library, QueryObject, rank
+from .retrieval_config import load_retrieval_config, override_config
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """A SAM candidate in prepared-image coordinates."""
+    mask: np.ndarray
+    score: float
+    area_frac: float
+
+    def __getitem__(self, key: str):
+        """Allow the small record to be used as either an object or mapping."""
+        if key not in {"mask", "score", "area_frac"}:
+            raise KeyError(key)
+        return getattr(self, key)
+
+
+class QueryEngine:
+    """Thread-safe, lazy model wrapper used by the Gradio front end."""
+
+    def __init__(self, library_root=None, config=None, retrieval_config=None,
+                 device: str = "cpu", sam=None, clip=None, paths=None):
+        self.device = device
+        self.paths = paths
+        if paths is None and config is not None:
+            self.paths = load_paths(config)
+        if library_root is None:
+            if self.paths is None:
+                self.paths = load_paths(config)
+            library_root = self.paths.library_root
+        self.library_root = Path(library_root)
+        self.library = Library.load(self.library_root)
+        self.config = load_retrieval_config(retrieval_config)
+        self._sam = sam
+        self._clip = clip
+        self._lock = threading.RLock()
+        self._clip_cache: dict[tuple[str, str], np.ndarray] = {}
+        self.last_message: str | None = None
+
+    @property
+    def sam(self):
+        with self._lock:
+            if self._sam is None:
+                from .models import SamPointSegmenter
+                cache = self.paths.hf_cache if self.paths is not None else None
+                self._sam = SamPointSegmenter(device=self.device, cache_dir=cache)
+        return self._sam
+
+    @property
+    def clip(self):
+        with self._lock:
+            if self._clip is None:
+                from .models import ClipEmbedder
+                cache = self.paths.hf_cache if self.paths is not None else None
+                self._clip = ClipEmbedder(device=self.device, cache_dir=cache)
+        return self._clip
+
+    @staticmethod
+    def _array(image) -> np.ndarray:
+        if isinstance(image, (str, os.PathLike)):
+            from PIL import Image
+            return np.asarray(Image.open(image).convert("RGB"))
+        if hasattr(image, "convert"):
+            image = image.convert("RGB")
+            return np.asarray(image)
+        arr = np.asarray(image)
+        if arr.ndim == 2:
+            arr = np.repeat(arr[..., None], 3, axis=2)
+        if arr.ndim != 3 or arr.shape[2] < 3:
+            raise ValueError("image must be an RGB image")
+        return np.asarray(arr[..., :3], dtype=np.uint8)
+
+    def candidates(self, image, x: float, y: float):
+        """Prepare *image*, map its pixel click, and run point-SAM.
+
+        Returns ``(prepared_rgb, candidates)`` where each candidate exposes
+        ``mask``, ``score`` and ``area_frac`` (and supports mapping-style
+        access for UI callbacks).
+        """
+        arr = self._array(image)
+        prepared, transform = prepare_image(arr, long_side=640)
+        px, py = transform.to_prepared(float(x), float(y))
+        with self._lock:
+            detections = self.sam.masks_at_point(prepared, px, py)
+        candidates = [
+            Candidate(mask=np.asarray(det.mask, dtype=bool), score=float(det.score),
+                      area_frac=float(np.asarray(det.mask, dtype=bool).mean()))
+            for det in detections
+        ]
+        return np.asarray(prepared), candidates
+
+    def _clip_vector(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        image = np.asarray(image)
+        mask = np.asarray(mask, dtype=bool)
+        key = (hashlib.sha1(image.tobytes()).hexdigest(), hashlib.sha1(mask.tobytes()).hexdigest())
+        with self._lock:
+            value = self._clip_cache.get(key)
+            if value is None:
+                value = np.asarray(self.clip.embed_masked([image], [mask])[0], dtype=np.float32)
+                self._clip_cache[key] = value
+            return value
+
+    def search(self, prepared, mask, mode=None, semantic=None, k=None,
+               min_scale=None, max_scale=None, max_translate=None, max_rot=None):
+        image = self._array(prepared)
+        mask = np.asarray(mask, dtype=bool)
+        mode = (mode or "soft").lower()
+        weight = self.config.semantic_weight if semantic is None else float(semantic)
+        clip_vector = self._clip_vector(image, mask) if weight != 0 else None
+        params = override_config(self.config, min_scale=min_scale, max_scale=max_scale,
+                                 max_translate_frac=max_translate, max_rot_deg=max_rot,
+                                 k=k, semantic_weight=weight)
+        query = QueryObject.from_mask(image, mask, clip_vector)
+        with self._lock:
+            results = rank(self.library, query, mode, semantic_weight=weight,
+                           k=params.k, params=params)
+        warnings = query_warnings(mask, mode, params.hard_limits, len(results))
+        return results, dict(getattr(results, "timings", {})), warnings
+
+    def shot_video(self, clip_id: str, shot_no: int):
+        """Create/cache a small H.264 clip for a library shot."""
+        self.last_message = None
+        if self.paths is None:
+            self.last_message = "video root is not configured"
+            return None
+        source = Path(self.paths.video_root) / f"{clip_id}.mp4"
+        if not source.is_file():
+            self.last_message = f"source video is missing: {source}"
+            return None
+        shot = self.library.shot(clip_id, shot_no)
+        if shot is None:
+            self.last_message = f"shot not found: {clip_id} shot {shot_no}"
+            return None
+        start = float(getattr(shot, "start_s"))
+        end = float(getattr(shot, "end_s"))
+        cache_dir = self.library_root / "cache" / "shot_clips"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        target = cache_dir / f"{clip_id}_{int(shot_no)}.mp4"
+        if target.is_file() and target.stat().st_size > 0:
+            return str(target)
+        fd, temp_name = tempfile.mkstemp(prefix=target.stem + ".", suffix=".mp4", dir=cache_dir)
+        os.close(fd)
+        temp = Path(temp_name)
+        try:
+            cmd = ["ffmpeg", "-y", "-ss", str(max(0.0, start)), "-i", str(source),
+                   "-t", str(max(0.01, end - start)), "-vf",
+                   "scale=w='if(gt(iw,ih),min(640,iw),-2)':h='if(gt(iw,ih),-2,min(640,ih))'",
+                   "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                   "-c:a", "aac", "-movflags", "+faststart", str(temp)]
+            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            if proc.returncode != 0 or not temp.is_file() or temp.stat().st_size == 0:
+                self.last_message = f"ffmpeg failed for {clip_id} shot {shot_no}: {proc.stderr.decode(errors='replace')[-300:]}"
+                return None
+            os.replace(temp, target)
+            return str(target)
+        finally:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+
+
+__all__ = ["Candidate", "QueryEngine"]
+
+
+def _result_gallery_item(engine, prepared, query_mask, result):
+    """Build a compact candidate/overlay panel for the Gradio gallery."""
+    import cv2
+    from PIL import Image
+    from .shape import cover_fit_matrix
+    from .render import _outline
+    candidate = np.asarray(Image.open(engine.library.keyframe_path(result.keyframe_id)).convert("RGB"))
+    cmask = engine.library.mask(result.object_id)
+    cand = _outline(candidate, cmask, (255, 170, 40))
+    q = np.asarray(prepared, dtype=np.uint8)
+    cover = cover_fit_matrix((candidate.shape[1], candidate.shape[0]), (q.shape[1], q.shape[0]))
+    # Compose the candidate cover-fit with the result's affine transform in
+    # homogeneous coordinates before passing the 2x3 matrix to OpenCV.
+    cover_h = np.vstack([cover, [0, 0, 1]])
+    transform_h = np.vstack([result.transform.matrix((q.shape[1], q.shape[0])), [0, 0, 1]])
+    mat = (transform_h @ cover_h)[:2]
+    aligned = cv2.warpAffine(candidate, mat, (q.shape[1], q.shape[0]), borderValue=(25, 25, 25))
+    warped = cv2.warpAffine(cmask.astype(np.uint8), mat, (q.shape[1], q.shape[0]), flags=cv2.INTER_NEAREST).astype(bool)
+    overlay = cv2.addWeighted(q, 0.5, aligned, 0.5, 0)
+    overlay = _outline(_outline(overlay, query_mask, (50, 220, 80)), warped, (255, 70, 60))
+    height = 220
+    def fit(im):
+        scale = min(320 / im.shape[1], height / im.shape[0])
+        small = cv2.resize(im, (max(1, round(im.shape[1]*scale)), max(1, round(im.shape[0]*scale))))
+        out = np.full((height, 320, 3), 25, dtype=np.uint8)
+        y, x = (height-small.shape[0])//2, (320-small.shape[1])//2
+        out[y:y+small.shape[0], x:x+small.shape[1]] = small
+        return out
+    panel = np.concatenate([fit(cand), fit(overlay)], axis=1)
+    caption = f"#{result.clip_id[:12]}… shot {result.shot_no}"
+    if result.start_s is not None and result.end_s is not None:
+        caption += f" [{result.start_s:.2f}-{result.end_s:.2f}s]"
+    caption += f" score={result.final_score:.3f} IoU={result.iou:.3f} cost={result.transform_cost:.3f}"
+    if result.clip_cosine is not None:
+        caption += f" CLIP={result.clip_cosine:.3f}"
+    return panel, caption
+
+
+def build_app(engine: QueryEngine | None = None, **engine_kwargs):
+    """Construct the Gradio Blocks application without launching a server."""
+    import gradio as gr
+    if engine is None:
+        engine = QueryEngine(**engine_kwargs)
+    cfg = engine.config
+    with gr.Blocks(title="Match-Cut Retriever") as app:
+        gr.Markdown("# CineDance Match-Cut Retriever\nUpload an image and click a subject to search matching shots.")
+        with gr.Row():
+            image = gr.Image(label="Query image", type="numpy")
+            prepared_view = gr.Image(label="Prepared image / selected mask", type="numpy", interactive=False)
+        candidates = gr.Radio(label="SAM candidates", choices=[], value=None)
+        warnings = gr.Markdown()
+        with gr.Row():
+            mode = gr.Radio(["soft", "hard"], value="soft", label="Mode")
+            semantic = gr.Slider(-1, 1, value=float(cfg.semantic_weight), step=0.05, label="Semantic preference (prefer different class ← ignore → prefer same class)")
+            k = gr.Slider(5, 50, value=min(20, max(5, cfg.k)), step=1, label="K")
+        with gr.Accordion("Hard-mode limits", open=False):
+            with gr.Row():
+                min_scale = gr.Number(value=cfg.min_scale, label="Minimum scale")
+                max_scale = gr.Number(value=cfg.max_scale, label="Maximum scale")
+                max_translate = gr.Number(value=cfg.max_translate_frac, label="Max translate (frame width fraction)")
+                max_rot = gr.Number(value=cfg.max_rot_deg, label="Max rotation (degrees)")
+        search_btn = gr.Button("Search", variant="primary")
+        timings = gr.Markdown()
+        gallery = gr.Gallery(label="Results", columns=2, height="auto", object_fit="contain", show_label=True)
+        breakdown = gr.JSON(label="Result breakdown")
+        video = gr.Video(label="Shot clip", interactive=False)
+        state = gr.State({"prepared": None, "items": []})
+        result_state = gr.State([])
+
+        def on_select(img, evt: gr.SelectData = None):
+            if img is None or evt is None or evt.index is None:
+                return gr.update(), gr.update(), "Upload an image and click a subject.", {"prepared": None, "items": []}
+            try:
+                x, y = evt.index[:2]
+                prepared, items = engine.candidates(img, x, y)
+                if not items:
+                    return prepared, gr.update(choices=[], value=None), "SAM returned no masks at this point.", {"prepared": prepared, "items": []}
+                choices = [f"{i}: {item['area_frac']:.1%} (score {item['score']:.3f})" for i, item in enumerate(items)]
+                # Show candidate zero by default.
+                from .render import _outline
+                preview = _outline(prepared, items[0]["mask"], (255, 70, 40))
+                return preview, gr.update(choices=choices, value=choices[0]), "Select a candidate mask, then Search.", {"prepared": prepared, "items": items}
+            except Exception as exc:
+                return gr.update(), gr.update(), f"Error: {exc}", {"prepared": None, "items": []}
+
+        def on_candidate(choice, st):
+            if not st or st.get("prepared") is None or not choice:
+                return gr.update(), st
+            idx = int(str(choice).split(":", 1)[0])
+            item = st["items"][idx]
+            from .render import _outline
+            return _outline(st["prepared"], item["mask"], (255, 70, 40)), st
+
+        def do_search(choice, st, mode_value, semantic_value, k_value, min_s, max_s, trans, rot):
+            if not st or st.get("prepared") is None or not choice:
+                return [], "Click the query image first.", {}, None
+            idx = int(str(choice).split(":", 1)[0]); item = st["items"][idx]
+            results, t, warns = engine.search(st["prepared"], item["mask"], mode_value, semantic_value, int(k_value), min_s, max_s, trans, rot)
+            gallery_items = [_result_gallery_item(engine, st["prepared"], item["mask"], r) for r in results]
+            msg = "\n".join(f"⚠️ {w}" for w in warns) if warns else ""
+            if t:
+                msg += ("\n" if msg else "") + "Timings: " + ", ".join(f"{key}={value:.3f}s" for key, value in t.items())
+            return gallery_items, msg, {"results": [r.to_dict() for r in results]}, results
+
+        def on_result(result_list, evt: gr.SelectData = None):
+            if evt is None or evt.index is None or not result_list:
+                return {}, None
+            idx = evt.index[0] if isinstance(evt.index, (tuple, list)) else evt.index
+            try:
+                result = result_list[int(idx)]
+                path = engine.shot_video(result.clip_id, result.shot_no)
+                return result.to_dict(), path
+            except Exception:
+                return {}, None
+
+        # Keep the click handler synchronous so Gradio preserves SelectData's
+        # pixel index before the longer SAM call is queued.
+        image.select(on_select, [image], [prepared_view, candidates, warnings, state], queue=False)
+        candidates.change(on_candidate, [candidates, state], [prepared_view, state])
+        search_btn.click(do_search, [candidates, state, mode, semantic, k, min_scale, max_scale, max_translate, max_rot], [gallery, timings, breakdown, result_state])
+        gallery.select(on_result, [result_state], [breakdown, video])
+    return app
+
+
+def main(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(description="Launch the Gradio match-cut query UI")
+    parser.add_argument("--config")
+    parser.add_argument("--library-root")
+    parser.add_argument("--retrieval-config")
+    parser.add_argument("--device", default="cpu")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--share", action="store_true")
+    args = parser.parse_args(argv)
+    app = build_app(library_root=args.library_root, config=args.config, retrieval_config=args.retrieval_config, device=args.device)
+    app.queue().launch(server_name=args.host, server_port=args.port, share=args.share)
+    return 0
+
+
+__all__ = ["Candidate", "QueryEngine", "build_app", "main"]
