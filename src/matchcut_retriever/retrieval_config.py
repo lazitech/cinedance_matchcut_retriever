@@ -19,6 +19,9 @@ class RetrievalConfig:
     k: int = 20
     semantic_weight: float = 0.0
     hard_axis_ecc_threshold: float = 0.8
+    # Principal-axis estimates are noisy (several degrees under small edits),
+    # so the axis exclusion only drops candidates beyond max_rot_deg + margin.
+    hard_axis_margin_deg: float = 10.0
 
     @property
     def min_scale(self): return self.hard_limits.min_scale
@@ -54,6 +57,7 @@ def load_retrieval_config(path: str | Path | None = None) -> RetrievalConfig:
         k=max(1, int(values.get("k", 20))),
         semantic_weight=float(values.get("semantic_weight", 0.0)),
         hard_axis_ecc_threshold=float(values.get("hard_axis_ecc_threshold", 0.8)),
+        hard_axis_margin_deg=max(0.0, float(values.get("hard_axis_margin_deg", 10.0))),
     )
 
 
@@ -67,7 +71,7 @@ def override_config(config: RetrievalConfig, **kwargs) -> RetrievalConfig:
         hard = replace(hard, **hard_updates)
     if soft_updates:
         soft = replace(soft, **soft_updates)
-    updates = {name: kwargs[name] for name in ("coarse_n", "hard_coarse_n", "workers", "k", "semantic_weight", "hard_axis_ecc_threshold") if kwargs.get(name) is not None}
+    updates = {name: kwargs[name] for name in ("coarse_n", "hard_coarse_n", "workers", "k", "semantic_weight", "hard_axis_ecc_threshold", "hard_axis_margin_deg") if kwargs.get(name) is not None}
     return replace(config, hard_limits=hard, soft_params=soft, **updates)
 
 

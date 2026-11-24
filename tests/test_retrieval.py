@@ -14,7 +14,7 @@ from PIL import Image
 
 from matchcut_retriever.masks import rle_encode
 from matchcut_retriever.retrieval import Library, QueryObject, rank
-from matchcut_retriever.retrieval_config import RetrievalConfig
+from matchcut_retriever.retrieval_config import RetrievalConfig, load_retrieval_config
 from matchcut_retriever.shape import HardLimits, object_geometry, shape_fingerprint
 from matchcut_retriever.query import _prepare, _transform_mask, build_parser, main as query_main
 
@@ -314,3 +314,19 @@ def test_hard_axis_threshold_keeps_mild_elongation_and_rejects_strong(tmp_path):
     strong_query = QueryObject.from_mask(np.zeros((100, 140, 3), dtype=np.uint8), strong_lib.mask(0))
     strong_results = rank(strong_lib, strong_query, "hard", params=RetrievalConfig(workers=1, hard_coarse_n=20), k=20)
     assert "strong" not in {result.clip_id for result in strong_results}
+
+
+def test_hard_axis_margin_tolerates_axis_noise(tmp_path):
+    # A strongly elongated candidate whose axis differs by 10 degrees (max_rot 6 +
+    # 4 degrees of estimate noise) is kept by the default margin, dropped without it.
+    root = make_library(tmp_path / "axis-margin", [
+        ("query", 0, "ellipse", (100, 140), (70, 50), (36, 12), 0),
+        ("noisy", 0, "ellipse", (100, 140), (70, 50), (36, 12), 10),
+    ])
+    lib = Library.load(root)
+    query = QueryObject.from_mask(np.zeros((100, 140, 3), dtype=np.uint8), lib.mask(0))
+    kept = rank(lib, query, "hard", params=RetrievalConfig(workers=1, hard_coarse_n=20), k=20)
+    assert "noisy" in {result.clip_id for result in kept}
+    strict = RetrievalConfig(workers=1, hard_coarse_n=20, hard_axis_margin_deg=0.0)
+    assert "noisy" not in {result.clip_id for result in rank(lib, query, "hard", params=strict, k=20)}
+    assert load_retrieval_config().hard_axis_margin_deg == 10.0

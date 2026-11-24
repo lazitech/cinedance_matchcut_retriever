@@ -175,7 +175,7 @@ def main(argv=None):
     payload = {
         "query": {"image": str(args.image), "prepared": bool(args.prepared), "x": float(x), "y": float(y), "mask_index": args.mask_index, "height": int(prepared.shape[0]), "width": int(prepared.shape[1]), "area_frac": float(mask.mean()), "candidates": candidates},
         "warnings": warnings,
-        "parameters": {"mode": args.mode, "semantic_weight": semantic, "k": config.k, "coarse_n": config.coarse_n, "hard_coarse_n": config.hard_coarse_n, "workers": config.workers, "hard_axis_ecc_threshold": config.hard_axis_ecc_threshold, "hard_limits": config.hard_limits.__dict__, "soft_params": config.soft_params.__dict__},
+        "parameters": {"mode": args.mode, "semantic_weight": semantic, "k": config.k, "coarse_n": config.coarse_n, "hard_coarse_n": config.hard_coarse_n, "workers": config.workers, "hard_axis_ecc_threshold": config.hard_axis_ecc_threshold, "hard_axis_margin_deg": config.hard_axis_margin_deg,"hard_limits": config.hard_limits.__dict__, "soft_params": config.soft_params.__dict__},
         "timings": results.timings,
         "results": [item.to_dict() for item in results],
     }

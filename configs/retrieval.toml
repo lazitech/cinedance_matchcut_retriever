@@ -15,3 +15,4 @@ workers = 8
 k = 20
 semantic_weight = 0.0
 hard_axis_ecc_threshold = 0.8
+hard_axis_margin_deg = 10.0
