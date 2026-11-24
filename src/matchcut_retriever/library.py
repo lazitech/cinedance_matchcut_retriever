@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import json
 import logging
 import os
@@ -22,9 +23,32 @@ from .framing import frame_quality
 from .masks import rle_decode, rle_encode
 from .models import Detection, ClipEmbedder, PanopticSegmenter, SamAutoSegmenter
 from .models.common import filter_detections
-from .shape import FINGERPRINT_DIM, MAX_AREA_FRAC, MIN_AREA_FRAC, object_geometry, shape_fingerprint
+from .shape import (
+    FINGERPRINT_DIM,
+    FINGERPRINT_VERSION,
+    MAX_AREA_FRAC,
+    MIN_AREA_FRAC,
+    object_geometry,
+    shape_fingerprint,
+)
 
 LOG = logging.getLogger(__name__)
+
+LEGACY_FINGERPRINT_VERSION = "r4"
+
+
+def _fingerprint_version(metadata: dict[str, Any]) -> str:
+    """Return a normalized fingerprint version, including legacy metadata."""
+
+    value = metadata.get("fingerprint_version", LEGACY_FINGERPRINT_VERSION)
+    return LEGACY_FINGERPRINT_VERSION if value is None else str(value)
+
+
+def _version_error(subject: str, version: str) -> ValueError:
+    return ValueError(
+        f"{subject} uses fingerprint version {version!r}, but the current version is "
+        f"{FINGERPRINT_VERSION!r}; run `python -m matchcut_retriever.library refingerprint`"
+    )
 
 OBJECT_COLUMNS = [
     "object_id", "keyframe_id", "clip_id", "shot_no", "k", "t_s", "frame_w", "frame_h",
@@ -240,7 +264,7 @@ class LibraryBuilder:
             "clip_model": _model_id(self.embedder),
             "segmenter_ids": [_model_id(segmenter) for segmenter in self.segmenters],
             "segmenter_params": {_model_id(segmenter): _model_params(segmenter) for segmenter in self.segmenters},
-            "fingerprint_version": 1,
+            "fingerprint_version": FINGERPRINT_VERSION,
         }
 
     def _write_part(self, clip_id: str, rows: list[dict[str, Any]], masks: list[np.ndarray], images: list[np.ndarray]) -> None:
@@ -409,7 +433,7 @@ def consolidate(root) -> dict[str, Any]:
     segments: set[str] = set()
     segmenter_params: dict[str, Any] = {}
     clip_models: set[str] = set()
-    fingerprint_versions: set[int] = set()
+    fingerprint_versions: set[str] = set()
     for cid in ids:
         part_dir = root / "parts" / cid
         parquet_path = part_dir / "objects.parquet"
@@ -438,11 +462,20 @@ def consolidate(root) -> dict[str, Any]:
             clip_models.add(str(info.get("clip_model", "clip")))
             segments.update(str(value) for value in info.get("segmenter_ids", []))
             segmenter_params.update(info.get("segmenter_params", {}))
-            if "fingerprint_version" in info:
-                fingerprint_versions.add(int(info["fingerprint_version"]))
         else:
+            info = {}
             columns = pd.read_parquet(parquet_path, columns=["segmenter"])
             segments.update(str(value) for value in columns["segmenter"].dropna().unique())
+        part_version = _fingerprint_version(info)
+        fingerprint_versions.add(part_version)
+        if part_version != FINGERPRINT_VERSION:
+            raise _version_error(f"part {cid}", part_version)
+    if len(fingerprint_versions) > 1:
+        versions = ", ".join(sorted(fingerprint_versions))
+        raise ValueError(
+            f"parts have mixed fingerprint versions ({versions}); run `python -m "
+            "matchcut_retriever.library refingerprint`"
+        )
     if len(clip_dimensions) > 1:
         raise ValueError("CLIP arrays have inconsistent dimensions")
     clip_dim = next(iter(clip_dimensions), 0)
@@ -574,7 +607,7 @@ def consolidate(root) -> dict[str, Any]:
             "clip_model": ",".join(sorted(clip_models)) if clip_models else "clip",
             "clip_dim": int(clip_dim),
             "fingerprint_dim": int(FINGERPRINT_DIM),
-            "fingerprint_version": next(iter(fingerprint_versions)) if len(fingerprint_versions) == 1 else 1,
+            "fingerprint_version": FINGERPRINT_VERSION,
             "built_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "clips": ids,
             "bytes": byte_sizes,
@@ -604,9 +637,110 @@ def consolidate(root) -> dict[str, Any]:
         "n_objects": total_objects,
         "n_clips": len(ids),
         "clip_dim": int(clip_dim),
+        "fingerprint_version": FINGERPRINT_VERSION,
         "generation": generation,
         "bytes": byte_sizes,
     }
+
+
+def _refingerprint_part_worker(part_path: str) -> dict[str, Any]:
+    """Recompute one part while keeping all non-fingerprint files untouched."""
+
+    part_dir = Path(part_path)
+    sidecar = part_dir / "meta.json"
+    metadata = json.loads(sidecar.read_text()) if sidecar.is_file() else {}
+    version = _fingerprint_version(metadata)
+    if version == FINGERPRINT_VERSION:
+        return {"part": part_dir.name, "status": "skipped", "objects": 0}
+
+    table = pd.read_parquet(part_dir / "objects.parquet", columns=["mask_nbytes"])
+    lengths = table["mask_nbytes"].to_numpy(dtype=np.int64, copy=False) if len(table) else np.empty(0, dtype=np.int64)
+    blob = (part_dir / "masks.bin").read_bytes()
+    fingerprints = np.empty((len(lengths), FINGERPRINT_DIM), dtype=np.float16)
+    offset = 0
+    for index, length in enumerate(lengths):
+        length = int(length)
+        if length < 0 or offset + length > len(blob):
+            raise ValueError(f"part {part_dir.name} has invalid mask lengths")
+        mask = rle_decode(blob[offset:offset + length])
+        fingerprints[index] = shape_fingerprint(mask).astype(np.float16)
+        offset += length
+    if offset != len(blob):
+        raise ValueError(f"part {part_dir.name} mask lengths disagree with masks.bin")
+
+    temp = _temp_dir(part_dir.parent, f".{part_dir.name}.refingerprint-")
+    backup = part_dir.parent / f".{part_dir.name}.refingerprint-backup-{uuid.uuid4().hex}"
+    try:
+        # Hard links keep unchanged files byte-identical without copying a
+        # potentially large part into the temporary directory.
+        for child in part_dir.iterdir():
+            if child.name in {"shape_fp.npy", "meta.json"}:
+                continue
+            target = temp / child.name
+            if child.is_file():
+                os.link(child, target)
+            elif child.is_dir():
+                shutil.copytree(child, target)
+        np.save(temp / "shape_fp.npy", fingerprints)
+        metadata["fingerprint_version"] = FINGERPRINT_VERSION
+        (temp / "meta.json").write_text(json.dumps(metadata, sort_keys=True))
+
+        # The directory swap makes the part appear wholly old or wholly new
+        # to readers.  Restore the original if the second rename fails.
+        os.replace(part_dir, backup)
+        try:
+            os.replace(temp, part_dir)
+        except Exception:
+            os.replace(backup, part_dir)
+            raise
+        shutil.rmtree(backup, ignore_errors=True)
+    except Exception:
+        shutil.rmtree(temp, ignore_errors=True)
+        if backup.exists() and not part_dir.exists():
+            os.replace(backup, part_dir)
+        raise
+    return {"part": part_dir.name, "status": "rewritten", "objects": len(lengths)}
+
+
+def refingerprint(root, workers: int = 1) -> dict[str, Any]:
+    """Recompute stale part fingerprints from their stored masks and publish the index."""
+
+    root = Path(root)
+    workers = max(1, int(workers))
+    part_root = root / "parts"
+    if part_root.is_dir():
+        # Complete or roll back a directory swap interrupted by a process
+        # crash before discovering parts for this run.
+        for backup in part_root.glob(".*.refingerprint-backup-*"):
+            name = backup.name.split(".refingerprint-backup-", 1)[0].lstrip(".")
+            final = part_root / name
+            if final.exists():
+                shutil.rmtree(backup, ignore_errors=True)
+            else:
+                os.replace(backup, final)
+    part_dirs = sorted(
+        (path for path in part_root.iterdir() if path.is_dir() and (path / "objects.parquet").is_file()),
+        key=lambda path: path.name,
+    ) if part_root.is_dir() else []
+    LOG.info("refingerprint: %d parts, workers=%d", len(part_dirs), workers)
+    results: list[dict[str, Any]] = []
+    if workers > 1 and len(part_dirs) > 1:
+        with ProcessPoolExecutor(max_workers=workers) as pool:
+            iterator = pool.map(_refingerprint_part_worker, [str(path) for path in part_dirs])
+            for result in iterator:
+                results.append(result)
+                LOG.info("refingerprint %s part %s (%d objects)", result["status"], result["part"], result["objects"])
+    else:
+        for part_dir in part_dirs:
+            result = _refingerprint_part_worker(str(part_dir))
+            results.append(result)
+            LOG.info("refingerprint %s part %s (%d objects)", result["status"], result["part"], result["objects"])
+    summary = consolidate(root)
+    rewritten = sum(result["status"] == "rewritten" for result in results)
+    skipped = sum(result["status"] == "skipped" for result in results)
+    summary.update({"parts": len(part_dirs), "rewritten_parts": rewritten, "skipped_parts": skipped})
+    LOG.info("refingerprint complete: rewritten=%d skipped=%d objects=%d", rewritten, skipped, summary["n_objects"])
+    return summary
 
 
 def verify_library(root) -> None:
@@ -621,6 +755,7 @@ def verify_library(root) -> None:
             raise ValueError("metadata keys")
         n_objects = int(meta["n_objects"])
         clip_dim = int(meta["clip_dim"])
+        fingerprint_version = _fingerprint_version(meta)
         expected_bytes = dict(meta["bytes"])
         paths = {
             "objects.parquet": root / "objects.parquet",
@@ -638,6 +773,7 @@ def verify_library(root) -> None:
         clip = tuple(np.load(paths["index/clip_emb.npy"], mmap_mode="r").shape)
         if shape != (n_objects, FINGERPRINT_DIM) or clip != (n_objects, clip_dim):
             raise ValueError("array shape")
+        LOG.info("verified library: objects=%d fingerprint_version=%s", n_objects, fingerprint_version)
     except Exception as exc:
         if isinstance(exc, RuntimeError) and str(exc) == message:
             raise
@@ -705,7 +841,10 @@ def neighbours(root, n: int = 12, k: int = 8, seed: int = 0, out=None) -> list[P
 def _summary(root: Path) -> dict[str, Any]:
     objects_path = root / "objects.parquet"
     if not objects_path.is_file():
-        return {"objects": 0, "clips": 0, "keyframes": 0, "skipped_keyframes": 0, "bytes": {}}
+        meta_path = root / "index" / "meta.json"
+        meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
+        return {"objects": 0, "clips": 0, "keyframes": 0, "skipped_keyframes": 0,
+                "fingerprint_version": _fingerprint_version(meta), "bytes": {}}
     frame = pd.read_parquet(objects_path)
     keyframes = int(frame["keyframe_id"].nunique()) if len(frame) else 0
     clips = int(frame["clip_id"].nunique()) if len(frame) else 0
@@ -713,7 +852,11 @@ def _summary(root: Path) -> dict[str, Any]:
     for path in [objects_path, root / "index" / "masks.bin", root / "index" / "shape_fp.npy", root / "index" / "clip_emb.npy", root / "index" / "meta.json"]:
         if path.is_file():
             bytes_map[str(path.relative_to(root))] = path.stat().st_size
-    return {"objects": len(frame), "clips": clips, "keyframes": keyframes, "skipped_keyframes": 0, "objects_per_keyframe": (len(frame) / keyframes if keyframes else 0.0), "bytes": bytes_map}
+    meta_path = root / "index" / "meta.json"
+    meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
+    return {"objects": len(frame), "clips": clips, "keyframes": keyframes, "skipped_keyframes": 0,
+            "objects_per_keyframe": (len(frame) / keyframes if keyframes else 0.0),
+            "fingerprint_version": _fingerprint_version(meta), "bytes": bytes_map}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -728,6 +871,7 @@ def main(argv: list[str] | None = None) -> int:
     build.add_argument("--no-consolidate", action="store_true")
     build.add_argument("--config")
     con = sub.add_parser("consolidate"); con.add_argument("--config")
+    ref = sub.add_parser("refingerprint"); ref.add_argument("--config"); ref.add_argument("--workers", type=int, default=1)
     stats = sub.add_parser("stats"); stats.add_argument("--config")
     neigh = sub.add_parser("neighbours"); neigh.add_argument("--n", type=int, default=12); neigh.add_argument("--k", type=int, default=8); neigh.add_argument("--seed", type=int, default=0); neigh.add_argument("--out"); neigh.add_argument("--config")
     args = parser.parse_args(argv)
@@ -736,6 +880,10 @@ def main(argv: list[str] | None = None) -> int:
     root = paths.library_root
     if args.command == "consolidate":
         print(json.dumps(consolidate(root), indent=2, sort_keys=True))
+    elif args.command == "refingerprint":
+        if args.workers < 1:
+            raise SystemExit("--workers must be >= 1")
+        print(json.dumps(refingerprint(root, args.workers), indent=2, sort_keys=True))
     elif args.command == "stats":
         verify_library(root)
         print(json.dumps(_summary(root), indent=2, sort_keys=True))

@@ -15,7 +15,7 @@ from PIL import Image
 from matchcut_retriever.masks import rle_encode
 from matchcut_retriever.retrieval import Library, QueryObject, rank
 from matchcut_retriever.retrieval_config import RetrievalConfig, load_retrieval_config
-from matchcut_retriever.shape import HardLimits, object_geometry, shape_fingerprint
+from matchcut_retriever.shape import FINGERPRINT_VERSION, HardLimits, object_geometry, shape_fingerprint
 from matchcut_retriever.query import _prepare, _transform_mask, build_parser, main as query_main
 
 
@@ -78,7 +78,7 @@ def make_library(tmp_path, specs):
     (root / "index" / "masks.bin").write_bytes(bytes(blob))
     np.save(root / "index" / "shape_fp.npy", np.asarray(fps, np.float16))
     np.save(root / "index" / "clip_emb.npy", np.asarray(embs, np.float16))
-    (root / "index" / "meta.json").write_text(json.dumps({"n_objects": len(objects), "fingerprint_dim": 1024, "clip_dim": 2}))
+    (root / "index" / "meta.json").write_text(json.dumps({"n_objects": len(objects), "fingerprint_dim": 1024, "clip_dim": 2, "fingerprint_version": FINGERPRINT_VERSION}))
     return root
 
 
