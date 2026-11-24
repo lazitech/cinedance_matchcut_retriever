@@ -415,9 +415,11 @@ def consolidate(root) -> dict[str, Any]:
                 seen.add(cid)
 
     part_root = root / "parts"
+    # Hidden directories are in-flight or interrupted temporaries (builder,
+    # refingerprint); clip ids never start with a dot.
     orphan_parts = {
         path.name for path in part_root.iterdir()
-        if path.is_dir() and (path / "objects.parquet").is_file() and path.name not in seen
+        if path.is_dir() and not path.name.startswith(".") and (path / "objects.parquet").is_file() and path.name not in seen
     } if part_root.is_dir() else set()
     if orphan_parts:
         clip_order = _clip_list(root / "clips.txt") if (root / "clips.txt").is_file() else []
@@ -718,8 +720,14 @@ def refingerprint(root, workers: int = 1) -> dict[str, Any]:
                 shutil.rmtree(backup, ignore_errors=True)
             else:
                 os.replace(backup, final)
+        # A crash before the swap leaves a half-written temporary; the original
+        # part is still in place, so the temporary is simply discarded.
+        for temp in part_root.glob(".*.refingerprint-*"):
+            if temp.is_dir() and ".refingerprint-backup-" not in temp.name:
+                shutil.rmtree(temp, ignore_errors=True)
     part_dirs = sorted(
-        (path for path in part_root.iterdir() if path.is_dir() and (path / "objects.parquet").is_file()),
+        (path for path in part_root.iterdir()
+         if path.is_dir() and not path.name.startswith(".") and (path / "objects.parquet").is_file()),
         key=lambda path: path.name,
     ) if part_root.is_dir() else []
     LOG.info("refingerprint: %d parts, workers=%d", len(part_dirs), workers)
@@ -773,11 +781,15 @@ def verify_library(root) -> None:
         clip = tuple(np.load(paths["index/clip_emb.npy"], mmap_mode="r").shape)
         if shape != (n_objects, FINGERPRINT_DIM) or clip != (n_objects, clip_dim):
             raise ValueError("array shape")
-        LOG.info("verified library: objects=%d fingerprint_version=%s", n_objects, fingerprint_version)
     except Exception as exc:
         if isinstance(exc, RuntimeError) and str(exc) == message:
             raise
         raise RuntimeError(message) from exc
+    # A consistent index built with another fingerprint is not loadable either;
+    # report it with the migration hint rather than as an inconsistency.
+    if fingerprint_version != FINGERPRINT_VERSION:
+        raise _version_error("library index", fingerprint_version)
+    LOG.info("verified library: objects=%d fingerprint_version=%s", n_objects, fingerprint_version)
 
 
 def _outline(image: np.ndarray, mask: np.ndarray) -> np.ndarray:

@@ -95,6 +95,35 @@ def test_consolidate_rejects_mixed_versions(tmp_path):
         consolidate(root)
 
 
+def test_interrupted_refingerprint_temp_is_not_a_part(tmp_path):
+    import shutil
+
+    root = _make_legacy_parts(tmp_path)
+    # Simulate a crash after the temporary copy was written but before the swap.
+    shutil.copytree(root / "parts" / "a", root / "parts" / ".a.refingerprint-crashed")
+    result = refingerprint(root, workers=1)
+    assert result["n_clips"] == 2 and result["rewritten_parts"] == 2
+    assert not list((root / "parts").glob(".*"))
+    library = Library.load(root)
+    assert set(library.objects.clip_id) == {"a", "b"}
+    assert len(library.objects) == len(library.objects.drop_duplicates(["keyframe_id", "bbox_x0", "bbox_y0", "bbox_x1", "bbox_y1"]))
+
+
+def test_verify_library_rejects_a_consistent_legacy_index(tmp_path):
+    from matchcut_retriever.library import verify_library
+
+    root = _make_root(tmp_path, clips=("a",), frames_per_clip=1)
+    LibraryBuilder(root, [FakeSegmenter("mask2former")], FakeEmbedder()).process_clips(["a"])
+    consolidate(root)
+    verify_library(root)
+    meta_path = root / "index" / "meta.json"
+    meta = json.loads(meta_path.read_text())
+    meta["fingerprint_version"] = "r4"
+    meta_path.write_text(json.dumps(meta))
+    with pytest.raises(ValueError, match="refingerprint"):
+        verify_library(root)
+
+
 def test_empty_current_library_loads(tmp_path):
     class EmptySegmenter(FakeSegmenter):
         def segment(self, images):
