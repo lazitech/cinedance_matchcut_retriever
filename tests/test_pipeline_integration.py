@@ -63,6 +63,35 @@ def test_query_cli_on_built_library(tmp_path):
     assert (out / "grid.jpg").is_file()
 
 
+def test_query_cli_warns_when_hard_mode_cannot_match_a_tiny_mask(tmp_path):
+    root = _build(tmp_path)
+    image = np.full((80, 100, 3), 128, np.uint8)
+    mask = np.zeros((80, 100), bool)
+    mask[40:42, 50:52] = True  # 0.05% of the frame, below the library's 0.5% floor
+    image_path, mask_path, out = tmp_path / "q.png", tmp_path / "m.png", tmp_path / "out"
+    Image.fromarray(image).save(image_path)
+    Image.fromarray(mask.astype(np.uint8) * 255).save(mask_path)
+    query_main([
+        "--image", str(image_path), "--x", "50", "--y", "40", "--prepared", "--mask", str(mask_path),
+        "--no-clip", "--mode", "hard", "--k", "3", "--library-root", str(root), "--out", str(out),
+    ])
+    payload = json.loads((out / "results.json").read_text())
+    assert payload["results"] == []
+    assert any("hard scale limits" in message for message in payload["warnings"])
+    assert any("no results" in message for message in payload["warnings"])
+    assert payload["query"]["area_frac"] < 0.005
+
+
+def test_query_warnings_quiet_for_a_normal_mask():
+    from matchcut_retriever.query import query_warnings
+    from matchcut_retriever.shape import HardLimits
+
+    mask = np.zeros((80, 100), bool)
+    mask[20:60, 30:70] = True
+    assert query_warnings(mask, "hard", HardLimits(), 5) == []
+    assert query_warnings(mask, "soft", HardLimits(), 5) == []
+
+
 def test_library_with_zero_objects_loads(tmp_path):
     class EmptySegmenter(FakeSegmenter):
         def segment(self, images):

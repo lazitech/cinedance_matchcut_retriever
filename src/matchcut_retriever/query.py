@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import cv2
@@ -14,6 +15,7 @@ from .config import load_paths
 from .render import render_results
 from .retrieval import Library, QueryObject, rank
 from .retrieval_config import load_retrieval_config, override_config
+from .shape import MAX_AREA_FRAC, MIN_AREA_FRAC
 
 
 def _read_rgb(path):
@@ -71,6 +73,25 @@ def _candidate_preview(image, detections, out_path):
         tile = cv2.resize(thumb, (tile_w, tile_h), interpolation=cv2.INTER_AREA)
         canvas[(i // cols) * tile_h:(i // cols + 1) * tile_h, (i % cols) * tile_w:(i % cols + 1) * tile_w] = tile
     Image.fromarray(canvas).save(out_path, quality=92)
+
+
+def query_warnings(mask, mode, limits, n_results):
+    """Explain query masks the library cannot match well, and empty result lists."""
+    area = float(np.asarray(mask, dtype=bool).mean())
+    warnings = []
+    if mode == "hard" and (area * limits.max_scale ** 2 < MIN_AREA_FRAC or area * limits.min_scale ** 2 > MAX_AREA_FRAC):
+        warnings.append(
+            f"query object covers {area:.2%} of the frame; library objects cover {MIN_AREA_FRAC:.1%}-{MAX_AREA_FRAC:.0%}, "
+            f"so no candidate fits the hard scale limits {limits.min_scale}-{limits.max_scale}; pick another --mask-index or use --mode soft"
+        )
+    elif area < MIN_AREA_FRAC or area > MAX_AREA_FRAC:
+        warnings.append(
+            f"query object covers {area:.2%} of the frame, outside the library's {MIN_AREA_FRAC:.1%}-{MAX_AREA_FRAC:.0%}; "
+            "consider another --mask-index"
+        )
+    if n_results == 0:
+        warnings.append(f"no results in {mode} mode" + (" within the hard limits" if mode == "hard" else ""))
+    return warnings
 
 
 def build_parser():
@@ -147,8 +168,13 @@ def main(argv=None):
     query = QueryObject.from_mask(prepared, mask, clip_vector)
     results = rank(library, query, args.mode, semantic_weight=semantic, k=config.k, params=config)
     render_results(prepared, mask, results, library, out / "grid.jpg")
+    warnings = query_warnings(mask, args.mode, config.hard_limits, len(results))
+    for message in warnings:
+        print(f"warning: {message}", file=sys.stderr)
+    candidates = [{"index": i, "area_frac": float(np.asarray(det.mask, dtype=bool).mean()), "score": float(det.score)} for i, det in enumerate(detections)]
     payload = {
-        "query": {"image": str(args.image), "prepared": bool(args.prepared), "x": float(x), "y": float(y), "mask_index": args.mask_index, "height": int(prepared.shape[0]), "width": int(prepared.shape[1])},
+        "query": {"image": str(args.image), "prepared": bool(args.prepared), "x": float(x), "y": float(y), "mask_index": args.mask_index, "height": int(prepared.shape[0]), "width": int(prepared.shape[1]), "area_frac": float(mask.mean()), "candidates": candidates},
+        "warnings": warnings,
         "parameters": {"mode": args.mode, "semantic_weight": semantic, "k": config.k, "coarse_n": config.coarse_n, "hard_coarse_n": config.hard_coarse_n, "workers": config.workers, "hard_axis_ecc_threshold": config.hard_axis_ecc_threshold, "hard_limits": config.hard_limits.__dict__, "soft_params": config.soft_params.__dict__},
         "timings": results.timings,
         "results": [item.to_dict() for item in results],

@@ -84,6 +84,9 @@ def object_geometry(mask: np.ndarray) -> ObjectGeometry:
 
 FINGERPRINT_SIZE = 32
 FINGERPRINT_DIM = FINGERPRINT_SIZE * FINGERPRINT_SIZE
+# Library objects cover this fraction of their analysis frame (CLAUDE.md 6.1.3).
+MIN_AREA_FRAC = 0.005
+MAX_AREA_FRAC = 0.60
 
 
 def shape_fingerprint(mask: np.ndarray) -> np.ndarray:
@@ -698,7 +701,7 @@ def hard_prefilter(q_geom: ObjectGeometry, cand: dict[str, np.ndarray], limits) 
 
 
 __all__ = [
-    "ObjectGeometry", "FINGERPRINT_DIM", "shape_fingerprint", "fingerprint_matrix",
+    "ObjectGeometry", "FINGERPRINT_DIM", "MIN_AREA_FRAC", "MAX_AREA_FRAC", "shape_fingerprint", "fingerprint_matrix",
     "object_geometry", "Similarity", "cover_fit_matrix", "HardLimits", "SoftParams",
     "MatchResult", "soft_match", "hard_match", "hard_prefilter",
 ]

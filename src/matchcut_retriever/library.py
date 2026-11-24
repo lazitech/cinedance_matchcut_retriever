@@ -22,7 +22,7 @@ from .framing import frame_quality
 from .masks import rle_decode, rle_encode
 from .models import Detection, ClipEmbedder, PanopticSegmenter, SamAutoSegmenter
 from .models.common import filter_detections
-from .shape import FINGERPRINT_DIM, object_geometry, shape_fingerprint
+from .shape import FINGERPRINT_DIM, MAX_AREA_FRAC, MIN_AREA_FRAC, object_geometry, shape_fingerprint
 
 LOG = logging.getLogger(__name__)
 
@@ -124,7 +124,7 @@ def build_objects(
         cleaned_mask = clean_mask(det.mask, min_component_frac)
         if cleaned_mask is not None:
             cleaned.append(Detection(cleaned_mask, det.score, det.label, det.source))
-    kept = filter_detections(cleaned, (h, w), 0.005, 0.60, max_objects)
+    kept = filter_detections(cleaned, (h, w), MIN_AREA_FRAC, MAX_AREA_FRAC, max_objects)
     rows: list[dict[str, Any]] = []
     masks: list[np.ndarray] = []
     for det in kept:
