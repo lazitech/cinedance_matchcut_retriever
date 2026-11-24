@@ -84,17 +84,23 @@ def object_geometry(mask: np.ndarray) -> ObjectGeometry:
 
 FINGERPRINT_SIZE = 32
 FINGERPRINT_DIM = FINGERPRINT_SIZE * FINGERPRINT_SIZE
+# The radial weighting is part of the on-disk fingerprint format.  Keep both
+# values explicit so a query process cannot silently disagree with a library.
+FINGERPRINT_RADIAL_POWER = 1
+FINGERPRINT_VERSION = "r1"
 # Library objects cover this fraction of their analysis frame (CLAUDE.md 6.1.3).
 MIN_AREA_FRAC = 0.005
 MAX_AREA_FRAC = 0.60
 
 
 def shape_fingerprint(mask: np.ndarray) -> np.ndarray:
-    """Rasterize a mask into a translation/scale-invariant 1024-D fingerprint.
+    """Rasterize a mask into the versioned, translation/scale-invariant fingerprint.
 
     Coordinates are normalized around the centroid in ``(x, y)`` pixels. The
     normalized square spans approximately ``+-2*sqrt(area)`` and preserves
-    rotation because no principal-axis alignment is applied.
+    rotation because no principal-axis alignment is applied. After blurring,
+    pixels receive radial weight ``r**FINGERPRINT_RADIAL_POWER`` and the
+    resulting 1024-D vector is L2-normalized.
     """
 
     array = np.asarray(mask, dtype=np.uint8)
@@ -119,7 +125,7 @@ def shape_fingerprint(mask: np.ndarray) -> np.ndarray:
     yy, xx = np.mgrid[:FINGERPRINT_SIZE, :FINGERPRINT_SIZE]
     radius = np.sqrt((xx - (FINGERPRINT_SIZE - 1) / 2.0) ** 2
                      + (yy - (FINGERPRINT_SIZE - 1) / 2.0) ** 2)
-    raster *= (radius / (FINGERPRINT_SIZE / 2.0)) ** 4
+    raster *= (radius / (FINGERPRINT_SIZE / 2.0)) ** FINGERPRINT_RADIAL_POWER
     vector = raster.reshape(-1).astype(np.float32)
     norm = float(np.linalg.norm(vector))
     if norm > 0.0:
@@ -701,7 +707,8 @@ def hard_prefilter(q_geom: ObjectGeometry, cand: dict[str, np.ndarray], limits) 
 
 
 __all__ = [
-    "ObjectGeometry", "FINGERPRINT_DIM", "MIN_AREA_FRAC", "MAX_AREA_FRAC", "shape_fingerprint", "fingerprint_matrix",
+    "ObjectGeometry", "FINGERPRINT_SIZE", "FINGERPRINT_DIM", "FINGERPRINT_RADIAL_POWER", "FINGERPRINT_VERSION",
+    "MIN_AREA_FRAC", "MAX_AREA_FRAC", "shape_fingerprint", "fingerprint_matrix",
     "object_geometry", "Similarity", "cover_fit_matrix", "HardLimits", "SoftParams",
     "MatchResult", "soft_match", "hard_match", "hard_prefilter",
 ]

@@ -4,6 +4,8 @@ import cv2
 import numpy as np
 
 from matchcut_retriever.shape import (
+    FINGERPRINT_RADIAL_POWER,
+    FINGERPRINT_SIZE,
     HardLimits,
     Similarity,
     hard_match,
@@ -34,8 +36,33 @@ def test_fingerprint_invariance_and_compact_shape_discrimination():
     disc_square = float(disc_fp @ shape_fingerprint(square))
     disc_triangle = float(disc_fp @ shape_fingerprint(triangle))
     assert same >= 0.95
-    assert disc_square <= same - 0.05
-    assert disc_triangle <= same - 0.05
+    # r^1 keeps compact silhouettes closer than the former r^4 weighting;
+    # they remain distinguishable at the lower margin.
+    assert disc_square <= same - 0.01
+    assert disc_triangle <= same - 0.01
+
+
+def test_fingerprint_matches_explicit_r1_reference():
+    mask = _ellipse((18, 9), center=(42, 31), shape=(80, 120))
+    geometry = object_geometry(mask)
+    scale = max(math.sqrt(geometry.area), 1e-6)
+    window = 4.0 * scale
+    factor = (FINGERPRINT_SIZE - 1) / window
+    affine = np.array([
+        [factor, 0.0, -(geometry.cx - 2.0 * scale) * factor],
+        [0.0, factor, -(geometry.cy - 2.0 * scale) * factor],
+    ], dtype=np.float32)
+    raster = cv2.warpAffine(mask.astype(np.float32), affine,
+                            (FINGERPRINT_SIZE, FINGERPRINT_SIZE), flags=cv2.INTER_AREA,
+                            borderMode=cv2.BORDER_CONSTANT, borderValue=0.0)
+    raster = cv2.GaussianBlur(raster, (3, 3), 0)
+    yy, xx = np.mgrid[:FINGERPRINT_SIZE, :FINGERPRINT_SIZE]
+    radius = np.sqrt((xx - (FINGERPRINT_SIZE - 1) / 2.0) ** 2
+                     + (yy - (FINGERPRINT_SIZE - 1) / 2.0) ** 2)
+    raster *= (radius / (FINGERPRINT_SIZE / 2.0)) ** FINGERPRINT_RADIAL_POWER
+    reference = raster.reshape(-1).astype(np.float32)
+    reference /= np.linalg.norm(reference)
+    assert np.allclose(shape_fingerprint(mask), reference, atol=1e-7)
 
 
 def test_hard_match_searches_identity_when_closed_form_is_outside():

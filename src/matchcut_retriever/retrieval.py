@@ -17,6 +17,7 @@ from .masks import rle_decode
 from .retrieval_config import RetrievalConfig, load_retrieval_config
 from .shape import (
     FINGERPRINT_DIM,
+    FINGERPRINT_VERSION,
     HardLimits,
     MatchResult,
     Similarity,
@@ -154,6 +155,13 @@ class Library:
         meta_path = root / "index" / "meta.json"
         import json
         meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
+        value = meta.get("fingerprint_version", "r4")
+        fingerprint_version = "r4" if value is None else str(value)
+        if fingerprint_version != FINGERPRINT_VERSION:
+            raise ValueError(
+                f"library fingerprint version {fingerprint_version!r} does not match current "
+                f"{FINGERPRINT_VERSION!r}; run `python -m matchcut_retriever.library refingerprint`"
+            )
         n = len(objects)
         if "object_id" not in objects or not np.array_equal(objects.object_id.to_numpy(), np.arange(n, dtype=np.int64)):
             raise ValueError("objects.parquet object_id must be contiguous 0..N-1")
