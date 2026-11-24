@@ -137,12 +137,16 @@ def test_build_app_with_injected_engine_does_not_launch(tmp_path):
     engine = _engine(tmp_path)
     app = build_app(engine)
     assert app is not None
+    # Shot clips live under the library, so launch() must allow that directory.
+    assert app.matchcut_allowed_paths == [str(engine.video_cache_dir)]
 
 
 def test_main_configures_and_launches_app(monkeypatch):
     calls = {}
 
     class FakeApp:
+        matchcut_allowed_paths = ["/tmp/library/cache/shot_clips"]
+
         def queue(self):
             calls["queued"] = True
             return self
@@ -158,7 +162,8 @@ def test_main_configures_and_launches_app(monkeypatch):
     assert app_module.main(["--library-root", "/tmp/library", "--host", "0.0.0.0", "--port", "8123", "--share"]) == 0
     assert calls["build"]["library_root"] == "/tmp/library"
     assert calls["queued"] is True
-    assert calls["launch"] == {"server_name": "0.0.0.0", "server_port": 8123, "share": True}
+    assert calls["launch"] == {"server_name": "0.0.0.0", "server_port": 8123, "share": True,
+                               "allowed_paths": ["/tmp/library/cache/shot_clips"]}
 
 
 def test_gradio_temp_dir_defaults_to_per_user_folder(tmp_path, monkeypatch):

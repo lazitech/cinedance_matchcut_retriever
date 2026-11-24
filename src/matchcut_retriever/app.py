@@ -146,6 +146,11 @@ class QueryEngine:
         warnings = query_warnings(mask, mode, params.hard_limits, len(results))
         return results, dict(getattr(results, "timings", {})), warnings
 
+    @property
+    def video_cache_dir(self) -> Path:
+        """Where shot clips are cached; the Gradio app must list it in ``allowed_paths``."""
+        return Path(self.library_root) / "cache" / "shot_clips"
+
     def shot_video(self, clip_id: str, shot_no: int):
         """Create/cache a small H.264 clip for a library shot."""
         self.last_message = None
@@ -162,7 +167,7 @@ class QueryEngine:
             return None
         start = float(getattr(shot, "start_s"))
         end = float(getattr(shot, "end_s"))
-        cache_dir = self.library_root / "cache" / "shot_clips"
+        cache_dir = self.video_cache_dir
         cache_dir.mkdir(parents=True, exist_ok=True)
         target = cache_dir / f"{clip_id}_{int(shot_no)}.mp4"
         if target.is_file() and target.stat().st_size > 0:
@@ -351,6 +356,8 @@ def build_app(engine: QueryEngine | None = None, **engine_kwargs):
         candidates.change(on_candidate, [candidates, state], [prepared_view, state])
         search_btn.click(do_search, [candidates, state, mode, semantic, k, min_scale, max_scale, max_translate, max_rot], [gallery, timings, breakdown, result_state])
         gallery.select(on_result, [result_state], [breakdown, video])
+    # Gradio only serves files from cwd/temp unless the directory is allowed at launch.
+    app.matchcut_allowed_paths = [str(engine.video_cache_dir)]
     return app
 
 
@@ -366,7 +373,11 @@ def main(argv=None):
     parser.add_argument("--share", action="store_true")
     args = parser.parse_args(argv)
     app = build_app(library_root=args.library_root, config=args.config, retrieval_config=args.retrieval_config, device=args.device)
-    app.queue().launch(server_name=args.host, server_port=args.port, share=args.share)
+    launch_kwargs = {"server_name": args.host, "server_port": args.port, "share": args.share}
+    allowed = getattr(app, "matchcut_allowed_paths", None)
+    if allowed:
+        launch_kwargs["allowed_paths"] = list(allowed)
+    app.queue().launch(**launch_kwargs)
     return 0
 
 
