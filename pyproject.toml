@@ -22,6 +22,11 @@ gpu = [
     "huggingface_hub>=0.24",
 ]
 
+# Gradio query UI (stage 7); run on the GPU server, CPU inference is fine.
+app = [
+    "gradio>=5.0",
+]
+
 [dependency-groups]
 dev = ["pytest>=8"]
 
