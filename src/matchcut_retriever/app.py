@@ -339,6 +339,12 @@ def build_app(engine: QueryEngine | None = None, **engine_kwargs):
                 )
             return breakdown, path
 
+        # This module uses postponed annotations, so `gr.SelectData` above is only a string that
+        # Gradio cannot resolve (gr is a local import); without the real class it never injects
+        # the event and every click looks like "no click".
+        on_select.__annotations__["evt"] = gr.SelectData
+        on_result.__annotations__["evt"] = gr.SelectData
+
         # Keep the click handler synchronous so Gradio preserves SelectData's
         # pixel index before the longer SAM call is queued.
         image.select(on_select, [image], [prepared_view, candidates, warnings, state], queue=False)

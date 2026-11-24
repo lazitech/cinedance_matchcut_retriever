@@ -168,3 +168,18 @@ def test_gradio_temp_dir_defaults_to_per_user_folder(tmp_path, monkeypatch):
     assert path.parent == tmp_path and path.name.startswith("gradio-") and path.is_dir()
     monkeypatch.setenv("GRADIO_TEMP_DIR", "/custom/dir")
     assert app_module._ensure_gradio_temp_dir() == "/custom/dir"
+
+
+def test_select_handlers_receive_gradio_event_data(tmp_path):
+    import pytest
+
+    gr = pytest.importorskip("gradio")
+    from gradio.helpers import special_args
+
+    app = build_app(_engine(tmp_path))
+    handlers = {dep.fn.__name__: dep.fn for dep in app.fns.values() if dep.fn is not None}
+    event = gr.SelectData(None, {"index": [12, 34], "value": None})
+    for name, inputs in (("on_select", [None]), ("on_result", [[]])):
+        args, *_ = special_args(handlers[name], inputs, None, event)
+        assert isinstance(args[-1], gr.SelectData), name
+        assert list(args[-1].index) == [12, 34]
