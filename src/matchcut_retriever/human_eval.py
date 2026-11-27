@@ -12,7 +12,7 @@ from PIL import Image
 from .framing import prepare_image
 from .query import _candidate_preview
 from .retrieval import Library, QueryObject, rank
-from .retrieval_config import load_retrieval_config
+from .retrieval_config import load_retrieval_config, override_config
 
 _LABEL_LOCK = threading.RLock()
 
@@ -59,8 +59,14 @@ def prepare_queries(spec, out, config=None, device="cpu", segmenter=None):
         if not image_path.is_absolute(): image_path = spec.parent / image_path
         image_bytes = image_path.read_bytes(); x, y = float(q["x"]), float(q["y"]); mi = int(q.get("mask_index", 0))
         digest = _hash_inputs(image_bytes, x, y, mi); qdir = out / "queries" / qid; qdir.mkdir(parents=True, exist_ok=True)
-        if old.get(qid, {}).get("input_hash") == digest and (qdir / "prepared.png").is_file() and (qdir / "mask.png").is_file():
-            manifests.append(old[qid]); continue
+        unchanged = old.get(qid, {}).get("input_hash") == digest and (qdir / "prepared.png").is_file() and (qdir / "mask.png").is_file()
+        if unchanged:
+            previous = old[qid]
+            # The image artifacts are reusable, but descriptive spec metadata is not.
+            manifest = dict(previous)
+            manifest.update({"id": qid, "group": q.get("group", ""), "note": q.get("note", ""), "exclude_clips": list(q.get("exclude_clips", [])), "image": str(image_path), "x": x, "y": y, "mask_index": mi, "input_hash": digest})
+            manifests.append(manifest)
+            continue
         image = np.asarray(Image.open(image_path).convert("RGB")); prepared, transform = prepare_image(image, long_side=640)
         px, py = transform.to_prepared(x, y); detections = segmenter.masks_at_point(prepared, px, py)
         if mi < 0 or mi >= len(detections): raise IndexError(f"mask index {mi} out of range (0..{len(detections)-1}) for query {qid}")
@@ -74,12 +80,8 @@ def prepare_queries(spec, out, config=None, device="cpu", segmenter=None):
     return manifests
 
 def _panel(library, prepared, mask, result):
-    try:
-        from .render import result_panel
-        return result_panel(library, prepared, mask, result)
-    except ImportError:
-        from .app import _result_gallery_item
-        return _result_gallery_item(type("E", (), {"library": library})(), prepared, mask, result, 1)[0]
+    from .render import result_panel
+    return result_panel(library, prepared, mask, result)
 
 def pool_results(out, config=None, library_root=None, retrieval_config=None, k=10, modes=("soft", "hard"), preload=False, seed=0):
     out = Path(out); qman = _read_json(out / "queries.json", {}); queries = qman.get("queries", [])
@@ -93,16 +95,32 @@ def pool_results(out, config=None, library_root=None, retrieval_config=None, k=1
         query = QueryObject.from_mask(prepared, mask, None); rankings[qid] = {}; pooled = {}
         excluded = set(q.get("exclude_clips", []))
         for mode in modes:
-            started = time.perf_counter(); results = rank(lib, query, mode, semantic_weight=0.0, k=max(int(k), len(lib.objects)), params=rc)
-            filtered = [r for r in results if r.clip_id not in excluded][:int(k)]
-            rankings[qid][mode] = {"results": [r.to_dict() for r in filtered], "timings": dict(getattr(results, "timings", {})), "elapsed_s": time.perf_counter() - started}
+            started = time.perf_counter()
+            base_coarse = int(rc.hard_coarse_n if mode == "hard" else rc.coarse_n)
+            coarse_sizes = []
+            results = []
+            excluded_count = 0
+            for factor in (1, 2, 4, 8, 16):
+                coarse_n = min(len(lib.objects), max(1, base_coarse * factor))
+                hard_coarse_n = min(len(lib.objects), max(1, int(rc.hard_coarse_n) * factor))
+                coarse_sizes.append({"coarse_n": coarse_n, "hard_coarse_n": hard_coarse_n})
+                params = override_config(rc, coarse_n=coarse_n, hard_coarse_n=hard_coarse_n,
+                                         k=max(int(k), len(lib.objects)))
+                results = rank(lib, query, mode, semantic_weight=0.0,
+                               k=max(int(k), len(lib.objects)), params=params)
+                eligible = [r for r in results if r.clip_id not in excluded]
+                excluded_count = len(results) - len(eligible)
+                if len(eligible) >= int(k) or (coarse_n >= len(lib.objects) and hard_coarse_n >= len(lib.objects)):
+                    break
+            filtered = eligible[:int(k)]
+            rankings[qid][mode] = {"results": [r.to_dict() for r in filtered], "timings": dict(getattr(results, "timings", {})), "elapsed_s": time.perf_counter() - started, "excluded_count": excluded_count, "coarse_sizes": coarse_sizes}
             for r in filtered: pooled[(r.clip_id, int(r.shot_no), int(r.object_id))] = r
         rng = np.random.default_rng(int(seed)); keys = list(pooled); rng.shuffle(keys); entries = []
         for idx, key in enumerate(keys):
             r = pooled[key]; item_id = hashlib.sha1((qid + "|" + "|".join(map(str, key))).encode()).hexdigest()[:16]
             ppath = out / "panels" / qid / f"{item_id}.jpg"; ppath.parent.mkdir(parents=True, exist_ok=True)
             if not ppath.is_file(): Image.fromarray(_panel(lib, prepared, mask, r)).save(ppath, quality=92)
-            entries.append({"item_id": item_id, "panel": str(ppath.relative_to(out)), "clip_id": r.clip_id, "shot_no": int(r.shot_no), "start_s": r.start_s, "end_s": r.end_s, "keyframe_id": r.keyframe_id, "t_s": r.t_s})
+            entries.append({"item_id": item_id, "panel": str(ppath.relative_to(out)), "clip_id": r.clip_id, "shot_no": int(r.shot_no), "object_id": int(r.object_id), "start_s": r.start_s, "end_s": r.end_s, "keyframe_id": r.keyframe_id, "t_s": r.t_s})
         items_manifest[qid] = entries
     _atomic_json(out / "rankings.json", rankings); _atomic_json(out / "items.json", {"queries": items_manifest}); return rankings, items_manifest
 
@@ -115,14 +133,15 @@ def save_labels(out, query_id, usable, judged, note=""):
     return labels[str(query_id)]
 
 def build_annotation_app(out, config=None, host="127.0.0.1", port=7870, share=False):
-    os.environ.setdefault("GRADIO_TEMP_DIR", str(Path(tempfile.gettempdir()) / f"gradio-{os.getuid()}"))
+    from .app import _ensure_gradio_temp_dir
+    _ensure_gradio_temp_dir()
     import gradio as gr
     out = Path(out); queries = _read_json(out / "queries.json", {}).get("queries", []); items = _read_json(out / "items.json", {}).get("queries", {}); labels = load_labels(out)
-    state = {"index": 0}
     with gr.Blocks(title="Human evaluation") as app:
         header = gr.Markdown(); note = gr.Markdown(); image = gr.Image(interactive=False); gallery = gr.Gallery(); checks = gr.CheckboxGroup(label="Usable for a match cut"); textbox = gr.Textbox(label="Note"); jump = gr.Dropdown(choices=[q["id"] for q in queries], label="Query"); save = gr.Button("Save & next"); prev = gr.Button("Previous"); video = gr.Video(interactive=False); message = gr.Markdown()
+        session_index = gr.State(0)
         def show(i):
-            i = max(0, min(int(i), len(queries)-1)); state["index"] = i; q = queries[i]; its = items.get(q["id"], []); lab = labels.get(q["id"], {}); header_v = f"query {i+1} / {len(queries)} · {len(set(lab.get('judged', [])) & {x['item_id'] for x in its})} labeled"
+            i = max(0, min(int(i), len(queries)-1)); q = queries[i]; its = items.get(q["id"], []); lab = labels.get(q["id"], {}); saved_count = sum(1 for query in queries if query["id"] in labels); status = "saved" if q["id"] in labels else "unsaved"; header_v = f"query {i+1} / {len(queries)} · {saved_count} labeled · {status}"
             prepared_path = out / "queries" / q["id"] / "prepared.png"
             prepared = np.asarray(Image.open(prepared_path).convert("RGB"))
             mask_path = out / "queries" / q["id"] / "mask.png"
@@ -132,14 +151,14 @@ def build_annotation_app(out, config=None, host="127.0.0.1", port=7870, share=Fa
                 contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 if contours:
                     cv2.polylines(prepared, contours, True, (255, 70, 40), 3)
-            return header_v, f"**{q.get('note','')}**  ·  {q.get('group','')}", prepared, [(str(out / x["panel"]), f"#{j+1}") for j,x in enumerate(its)], gr.update(choices=[f"#{j+1}" for j in range(len(its))], value=[f"#{j+1}" for j,x in enumerate(its) if x["item_id"] in lab.get("usable", [])]), lab.get("note", ""), q["id"]
-        def do_save(chosen, text, qid):
-            its = items.get(qid, []); usable = [its[int(str(c)[1:]) - 1]["item_id"] for c in (chosen or [])]; save_labels(out, qid, usable, [x["item_id"] for x in its], text); labels.update(load_labels(out)); return show(min(state["index"] + 1, len(queries)-1))
-        def on_gallery_select(evt: gr.SelectData):
+            return header_v, f"**{q.get('note','')}**  ·  {q.get('group','')}", prepared, [(str(out / x["panel"]), f"#{j+1}") for j,x in enumerate(its)], gr.update(choices=[f"#{j+1}" for j in range(len(its))], value=[f"#{j+1}" for j,x in enumerate(its) if x["item_id"] in lab.get("usable", [])]), lab.get("note", ""), q["id"], i
+        def do_save(chosen, text, qid, i):
+            its = items.get(qid, []); usable = [its[int(str(c)[1:]) - 1]["item_id"] for c in (chosen or [])]; save_labels(out, qid, usable, [x["item_id"] for x in its], text); labels.update(load_labels(out)); return show(min(int(i) + 1, len(queries)-1))
+        def on_gallery_select(evt: gr.SelectData, i):
             if evt is None or evt.index is None or not queries:
                 return None, ""
             idx = evt.index[0] if isinstance(evt.index, (tuple, list)) else evt.index
-            q = queries[state["index"]]; its = items.get(q["id"], [])
+            q = queries[int(i)]; its = items.get(q["id"], [])
             try:
                 item = its[int(idx)]
             except (IndexError, TypeError, ValueError):
@@ -157,7 +176,9 @@ def build_annotation_app(out, config=None, host="127.0.0.1", port=7870, share=Fa
             except (FileNotFoundError, KeyError, OSError) as exc:
                 return None, f"Video is unavailable: {exc}"
         on_gallery_select.__annotations__["evt"] = gr.SelectData
-        app.load(lambda: show(0), outputs=[header,note,image,gallery,checks,textbox,jump]); jump.change(lambda q: show([x["id"] for x in queries].index(q)), jump, [header,note,image,gallery,checks,textbox,jump]); save.click(do_save, [checks,textbox,jump], [header,note,image,gallery,checks,textbox,jump]); prev.click(lambda: show(state["index"]-1), outputs=[header,note,image,gallery,checks,textbox,jump]); gallery.select(on_gallery_select, inputs=[], outputs=[video, message])
+        outputs = [header,note,image,gallery,checks,textbox,jump,session_index]
+        on_gallery_select.__annotations__["evt"] = gr.SelectData
+        app.load(lambda: show(0), outputs=outputs); jump.change(lambda q: show([x["id"] for x in queries].index(q)), jump, outputs); save.click(do_save, [checks,textbox,jump,session_index], outputs); prev.click(lambda i: show(max(int(i)-1, 0)), [session_index], outputs); gallery.select(on_gallery_select, [session_index], [video, message])
     app.matchcut_allowed_paths = [str(out)]; app.human_eval_out = out; return app
 
 def report_results(out, k=10):
@@ -166,8 +187,7 @@ def report_results(out, k=10):
     item_lookup = {(qid, (x.get("clip_id"), int(x.get("shot_no", 0)), x.get("object_id"))): x.get("item_id") for qid, arr in items_by_query.items() for x in arr}
     def result_item_id(qid, result):
         key = (qid, (result.get("clip_id"), int(result.get("shot_no", 0)), result.get("object_id")))
-        fallback = hashlib.sha1((qid + "|" + "|".join(str(result.get(x)) for x in ("clip_id", "shot_no", "object_id"))).encode()).hexdigest()[:16]
-        return item_lookup.get(key) or fallback
+        return item_lookup.get(key)
     for mode in modes:
         vals=[]; hits=[]; returned=[]
         for qid, modeset in rankings.items():
@@ -176,14 +196,20 @@ def report_results(out, k=10):
             rs = modeset.get(mode, {}).get("results", [])[:k]
             ids = []
             for r in rs:
-                ids.append(result_item_id(qid, r))
+                item_id = result_item_id(qid, r)
+                if item_id is not None:
+                    ids.append(item_id)
             n = sum(i in usable for i in ids)
             vals.append(n / k); hits.append(bool(n)); returned.append(len(rs))
             rows.append({"query": qid, "group": qman.get(qid, {}).get("group", ""), "mode": mode, "usable": n, "returned": len(rs)})
         summary[mode]={"P@K": float(np.mean(vals)) if vals else 0.0, "precision_returned": float(sum(r["usable"] for r in rows if r["mode"]==mode)/max(1,sum(r["returned"] for r in rows if r["mode"]==mode))), "mean_returned": float(np.mean(returned)) if returned else 0.0, "Hit@K": float(np.mean(hits)) if hits else 0.0}
     unjudged=[]; its=_read_json(out / "items.json", {}).get("queries", {})
+    unlabeled = [qid for qid in qman if qid not in labels]
     for qid, arr in its.items():
-        if qid in labels: unjudged.extend([x["item_id"] for x in arr if x["item_id"] not in labels[qid].get("judged", [])])
+        if qid not in labels:
+            unjudged.extend([x["item_id"] for x in arr])
+        else:
+            unjudged.extend([x["item_id"] for x in arr if x["item_id"] not in labels[qid].get("judged", [])])
     groups = {}
     for group in sorted({r.get("group", "") for r in rows}):
         groups[group] = {}
@@ -197,7 +223,18 @@ def report_results(out, k=10):
         for mode in modes:
             sets.append({result_item_id(qid, r) for r in modeset.get(mode, {}).get("results", [])})
         overlap[qid] = sorted(x for x in (set.intersection(*sets) if sets else set()) if x)
-    payload={"k":k,"modes":summary,"groups":groups,"per_query":rows,"overlap":overlap,"unjudged":unjudged}; _atomic_json(out / "report.json", payload); md="# Human evaluation report\n\n"+"\n".join(f"- **{m}**: P@{k}={v['P@K']:.3f}, Hit@{k}={v['Hit@K']:.3f}, precision returned={v['precision_returned']:.3f}, mean returned={v['mean_returned']:.2f}" for m,v in summary.items()); (out/"report.md").write_text(md); print(md); return payload
+    payload={"k":k,"modes":summary,"groups":groups,"per_query":rows,"overlap":overlap,"unjudged":unjudged,"unlabeled":unlabeled}; _atomic_json(out / "report.json", payload)
+    lines = ["# Human evaluation report", "", "## Mode summary", ""]
+    lines += [f"- **{m}**: P@{k}={v['P@K']:.3f}, Hit@{k}={v['Hit@K']:.3f}, precision returned={v['precision_returned']:.3f}, mean returned={v['mean_returned']:.2f}" for m,v in summary.items()]
+    lines += ["", "## Group breakdown", "", "| Group | Mode | P@K | Hit@K | Mean returned |", "|---|---|---:|---:|---:|"]
+    for group, group_modes in groups.items():
+        for mode, vals in group_modes.items():
+            lines.append(f"| {group or '(none)'} | {mode} | {vals['P@K']:.3f} | {vals['Hit@K']:.3f} | {vals['mean_returned']:.2f} |")
+    lines += ["", "## Per-query results", "", "| Query | Group | Mode | Usable | Returned |", "|---|---|---|---:|---:|"]
+    lines += [f"| {r['query']} | {r.get('group','')} | {r['mode']} | {r['usable']} | {r['returned']} |" for r in rows]
+    lines += ["", "## Overlap", ""] + [f"- **{qid}**: {', '.join(vals) if vals else '(none)'}" for qid, vals in overlap.items()]
+    lines += ["", "## Unjudged items", "", ", ".join(unjudged) if unjudged else "(none)", "", "## Unlabeled queries", "", ", ".join(unlabeled) if unlabeled else "(none)", ""]
+    md = "\n".join(lines); (out/"report.md").write_text(md); print(md); return payload
 
 prepare = prepare_queries
 pool = pool_results

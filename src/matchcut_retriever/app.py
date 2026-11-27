@@ -19,7 +19,7 @@ from .retrieval import Library, QueryObject, rank
 from .retrieval_config import load_retrieval_config, override_config
 
 
-def cut_shot_clip(source, start_s: float, end_s: float, target) -> bool:
+def cut_shot_clip(source, start_s: float, end_s: float, target, error_out=None) -> bool:
     """Cut and encode a shot clip atomically with ffmpeg."""
     source, target = Path(source), Path(target)
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -34,6 +34,8 @@ def cut_shot_clip(source, start_s: float, end_s: float, target) -> bool:
                "-c:a", "aac", "-movflags", "+faststart", str(temp)]
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
         if proc.returncode != 0 or not temp.is_file() or temp.stat().st_size == 0:
+            if error_out is not None:
+                error_out.append(proc.stderr.decode(errors="replace")[-300:])
             return False
         os.replace(temp, target)
         return True
@@ -203,8 +205,10 @@ class QueryEngine:
         target = cache_dir / f"{clip_id}_{int(shot_no)}.mp4"
         if target.is_file() and target.stat().st_size > 0:
             return str(target)
-        if not cut_shot_clip(source, start, end, target):
-            self.last_message = f"ffmpeg failed for {clip_id} shot {shot_no}"
+        errors = []
+        if not cut_shot_clip(source, start, end, target, errors):
+            detail = errors[0] if errors else ""
+            self.last_message = f"ffmpeg failed for {clip_id} shot {shot_no}: {detail}".rstrip()
             return None
         return str(target)
 
@@ -383,7 +387,7 @@ def main(argv=None):
     return 0
 
 
-__all__ = ["Candidate", "QueryEngine", "build_app", "main"]
+__all__ = ["Candidate", "QueryEngine", "build_app", "cut_shot_clip", "main"]
 
 
 if __name__ == "__main__":
