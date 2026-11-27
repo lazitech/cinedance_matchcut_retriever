@@ -38,6 +38,41 @@ def _font(size=20):
     return ImageFont.load_default()
 
 
+def result_panel(library, prepared, query_mask, result) -> np.ndarray:
+    """Render one candidate keyframe above its aligned overlay.
+
+    This is the compact panel used by the Gradio query UI and human-evaluation
+    tool.  It deliberately contains no captions so callers can choose whether
+    metadata is appropriate for their audience.
+    """
+    candidate = np.asarray(Image.open(library.keyframe_path(result.keyframe_id)).convert("RGB"))
+    candidate_mask = np.asarray(library.mask(result.object_id), dtype=bool)
+    query = np.asarray(prepared, dtype=np.uint8)
+    query_mask = np.asarray(query_mask, dtype=bool)
+    if query.ndim != 3 or query_mask.shape != query.shape[:2]:
+        raise ValueError("prepared and query_mask dimensions do not match")
+    cand = _outline(candidate, candidate_mask, (255, 170, 40))
+    cover = cover_fit_matrix((candidate.shape[1], candidate.shape[0]), (query.shape[1], query.shape[0]))
+    cover_h = np.vstack([cover, [0, 0, 1]])
+    transform_h = np.vstack([result.transform.matrix((query.shape[1], query.shape[0])), [0, 0, 1]])
+    mat = (transform_h @ cover_h)[:2]
+    aligned = cv2.warpAffine(candidate, mat, (query.shape[1], query.shape[0]), borderValue=(25, 25, 25))
+    warped = cv2.warpAffine(candidate_mask.astype(np.uint8), mat, (query.shape[1], query.shape[0]), flags=cv2.INTER_NEAREST).astype(bool)
+    overlay = cv2.addWeighted(query, 0.5, aligned, 0.5, 0)
+    overlay = _outline(_outline(overlay, query_mask, (50, 220, 80)), warped, (255, 70, 60))
+    height, width = 220, 320
+
+    def fit(image):
+        scale = min(width / image.shape[1], height / image.shape[0])
+        small = cv2.resize(image, (max(1, round(image.shape[1] * scale)), max(1, round(image.shape[0] * scale))))
+        out = np.full((height, width, 3), 25, dtype=np.uint8)
+        y, x = (height - small.shape[0]) // 2, (width - small.shape[1]) // 2
+        out[y:y + small.shape[0], x:x + small.shape[1]] = small
+        return out
+
+    return np.concatenate([fit(cand), fit(overlay)], axis=0)
+
+
 def render_results(query_image, query_mask, results, library, out_path):
     """Write a readable query/candidate/aligned-overlay result grid."""
     query = np.asarray(query_image, dtype=np.uint8)
@@ -86,4 +121,4 @@ def render_results(query_image, query_mask, results, library, out_path):
     return out
 
 
-__all__ = ["render_results"]
+__all__ = ["render_results", "result_panel"]
