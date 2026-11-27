@@ -645,12 +645,30 @@ def consolidate(root) -> dict[str, Any]:
     }
 
 
+PCA_METADATA = "shape_pca.json"
+
+
+def pca_files(index: Path, pca_meta: dict[str, Any]) -> tuple[Path, Path]:
+    """Projection and basis files named by a PCA metadata document.
+
+    Each build writes its arrays under build-specific names and publishes them by atomically
+    replacing ``shape_pca.json``, so a reader never pairs arrays from two different builds.
+    Metadata without file names refers to the legacy fixed names.
+    """
+    names = (str(pca_meta.get("projections_file", "shape_pca.npy")),
+             str(pca_meta.get("basis_file", "shape_pca_basis.npy")))
+    for name in names:
+        if Path(name).name != name or name.startswith("."):
+            raise ValueError(f"invalid PCA file name in metadata: {name!r}")
+    return index / names[0], index / names[1]
+
+
 def _pca_status(root: Path, meta: dict[str, Any] | None = None) -> tuple[str, str]:
     """Return the published PCA index status without raising on stale files."""
 
     root = Path(root)
     index = root / "index"
-    metadata_path = index / "shape_pca.json"
+    metadata_path = index / PCA_METADATA
     if not metadata_path.is_file():
         return "absent", "metadata missing"
     try:
@@ -666,8 +684,9 @@ def _pca_status(root: Path, meta: dict[str, Any] | None = None) -> tuple[str, st
             return "stale", "fingerprint version mismatch"
         if dim < 1 or dim > FINGERPRINT_DIM:
             return "stale", "invalid dimension"
-        projections = np.load(index / "shape_pca.npy", mmap_mode="r")
-        basis = np.load(index / "shape_pca_basis.npy", mmap_mode="r")
+        projections_path, basis_path = pca_files(index, pca_meta)
+        projections = np.load(projections_path, mmap_mode="r")
+        basis = np.load(basis_path, mmap_mode="r")
         if projections.shape != (n_objects, dim) or basis.shape != (FINGERPRINT_DIM, dim):
             return "stale", "array shape mismatch"
         if projections.ndim != 2 or basis.ndim != 2:
@@ -713,9 +732,13 @@ def build_pca(root, dim: int = 128, sample: int = 200_000, seed: int = 0) -> dic
     index_dir = root / "index"
     index_dir.mkdir(parents=True, exist_ok=True)
     token = uuid.uuid4().hex
-    projections_tmp = index_dir / f".shape_pca-{token}.npy"
-    basis_tmp = index_dir / f".shape_pca_basis-{token}.npy"
+    # Arrays get build-specific names; replacing shape_pca.json is the single atomic publish step.
+    projections_name = f"shape_pca-{token}.npy"
+    basis_name = f"shape_pca_basis-{token}.npy"
+    projections_tmp = index_dir / f".{projections_name}"
+    basis_tmp = index_dir / f".{basis_name}"
     metadata_tmp = index_dir / f".shape_pca-{token}.json"
+    published = False
     projections_mem = None
     try:
         projections_mem = np.lib.format.open_memmap(
@@ -737,16 +760,28 @@ def build_pca(root, dim: int = 128, sample: int = 200_000, seed: int = 0) -> dic
             "fingerprint_version": FINGERPRINT_VERSION,
             "generation": meta["generation"],
             "explained_energy_fraction": explained,
+            "projections_file": projections_name,
+            "basis_file": basis_name,
         }
         metadata_tmp.write_text(json.dumps(pca_meta, indent=2, sort_keys=True))
-        os.replace(projections_tmp, index_dir / "shape_pca.npy")
-        os.replace(basis_tmp, index_dir / "shape_pca_basis.npy")
-        os.replace(metadata_tmp, index_dir / "shape_pca.json")
+        os.replace(projections_tmp, index_dir / projections_name)
+        os.replace(basis_tmp, index_dir / basis_name)
+        os.replace(metadata_tmp, index_dir / PCA_METADATA)
+        published = True
     finally:
         if projections_mem is not None:
             projections_mem.flush()
         for path in (projections_tmp, basis_tmp, metadata_tmp):
             path.unlink(missing_ok=True)
+        if not published:
+            for name in (projections_name, basis_name):
+                (index_dir / name).unlink(missing_ok=True)
+    # Remove arrays of earlier builds (including the legacy fixed names) now that nothing refers to them.
+    keep = {projections_name, basis_name}
+    for pattern in ("shape_pca*.npy", "shape_pca_basis*.npy"):
+        for path in index_dir.glob(pattern):
+            if path.name not in keep:
+                path.unlink(missing_ok=True)
     return {
         "dim": dim,
         "sample": sample,

@@ -14,7 +14,7 @@ import numpy as np
 import pandas as pd
 
 from .masks import rle_decode
-from .library import _pca_status
+from .library import _pca_status, pca_files
 from .retrieval_config import RetrievalConfig, load_retrieval_config
 from .shape import (
     FINGERPRINT_DIM,
@@ -216,8 +216,7 @@ class Library:
             try:
                 pmeta = json.loads(pca_meta_path.read_text())
                 dim = int(pmeta["dim"])
-                pca_path = root / "index" / "shape_pca.npy"
-                basis_path = root / "index" / "shape_pca_basis.npy"
+                pca_path, basis_path = pca_files(root / "index", pmeta)
                 shape_pca = np.asarray(np.load(pca_path), dtype=np.float32)
                 basis = np.asarray(np.load(basis_path), dtype=np.float32)
                 shape_pca = np.ascontiguousarray(shape_pca)

@@ -9,6 +9,7 @@ from matchcut_retriever.library import (
     _summary,
     build_pca,
     consolidate,
+    pca_files,
     verify_library,
 )
 from matchcut_retriever.retrieval import Library, QueryObject, rank
@@ -45,9 +46,10 @@ def test_build_pca_files_shapes_dtypes_metadata_orthonormal_and_deterministic(tm
     root = _built_root(tmp_path)
     first = _build_pca(root, dim=8)
     index = root / "index"
-    projections = np.load(index / "shape_pca.npy")
-    basis = np.load(index / "shape_pca_basis.npy")
     metadata = json.loads((index / "shape_pca.json").read_text())
+    projections_path, basis_path = pca_files(index, metadata)
+    projections = np.load(projections_path)
+    basis = np.load(basis_path)
     assert projections.shape == (first["n_objects"], 8)
     assert projections.dtype == np.float16
     assert basis.shape == (FINGERPRINT_DIM, 8)
@@ -61,7 +63,13 @@ def test_build_pca_files_shapes_dtypes_metadata_orthonormal_and_deterministic(tm
     assert 0.0 <= metadata["explained_energy_fraction"] <= 1.0
     before = basis.copy()
     _build_pca(root, dim=8)
-    assert np.array_equal(before, np.load(index / "shape_pca_basis.npy"))
+    second_meta = json.loads((index / "shape_pca.json").read_text())
+    assert np.array_equal(before, np.load(pca_files(index, second_meta)[1]))
+    # The rebuild published new arrays and removed the first build's files.
+    assert second_meta["projections_file"] != metadata["projections_file"]
+    assert not projections_path.exists() and not basis_path.exists()
+    assert sorted(p.name for p in index.glob("shape_pca*")) == sorted(
+        ["shape_pca.json", second_meta["projections_file"], second_meta["basis_file"]])
 
 
 @pytest.mark.parametrize("mode", ["soft", "hard"])
@@ -134,7 +142,8 @@ def test_consolidate_makes_pca_stale_and_auto_falls_back(tmp_path):
 def test_bad_pca_arrays_are_stale_and_load_does_not_crash(tmp_path, kind):
     root = _built_root(tmp_path)
     _build_pca(root, dim=4)
-    path = root / "index" / ("shape_pca.npy" if kind == "truncated" else "shape_pca_basis.npy")
+    projections_path, basis_path = pca_files(root / "index", json.loads((root / "index" / "shape_pca.json").read_text()))
+    path = projections_path if kind == "truncated" else basis_path
     if kind == "truncated":
         path.write_bytes(path.read_bytes()[:-32])
     else:
@@ -179,3 +188,35 @@ def test_exact_duplicate_fingerprint_tie_order_and_preload_equality(tmp_path):
     assert [(r.object_id, r.fingerprint_cosine, r.final_score) for r in warm_results] == [
         (r.object_id, r.fingerprint_cosine, r.final_score) for r in cold_results
     ]
+
+
+def test_failed_pca_rebuild_keeps_previous_index_consistent(tmp_path, monkeypatch):
+    root = _built_root(tmp_path)
+    _build_pca(root, dim=4)
+    index = root / "index"
+    before_meta = (index / "shape_pca.json").read_text()
+    real_replace = __import__("os").replace
+
+    def failing_replace(src, dst):
+        # Fail when publishing the metadata of the second build.
+        if str(dst).endswith("shape_pca.json"):
+            raise OSError("simulated crash before publish")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr("matchcut_retriever.library.os.replace", failing_replace)
+    with pytest.raises(OSError):
+        _build_pca(root, dim=6)
+    monkeypatch.undo()
+    assert (index / "shape_pca.json").read_text() == before_meta
+    library = Library.load(root)
+    assert library.pca_status == "valid" and library.shape_pca.shape[1] == 4
+    # No orphaned arrays from the failed build remain.
+    meta = json.loads(before_meta)
+    assert sorted(p.name for p in index.glob("shape_pca*")) == sorted(
+        ["shape_pca.json", meta["projections_file"], meta["basis_file"]])
+    assert not list(index.glob(".shape_pca*"))
+
+
+def test_pca_metadata_rejects_path_like_file_names(tmp_path):
+    with pytest.raises(ValueError):
+        pca_files(tmp_path, {"projections_file": "../x.npy", "basis_file": "b.npy"})
