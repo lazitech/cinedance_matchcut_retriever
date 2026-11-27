@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, asdict, replace
 import logging
 import math
 import multiprocessing
+import os
 import threading
 from pathlib import Path
 import time
@@ -329,11 +330,26 @@ def _rerank(query_mask, candidate_blobs, mode, limits, soft_params, workers):
     return [match for chunk in chunks for match in chunk]
 
 
-def _coarse_cosines(query_fp, matrix, chunk=65536):
+def _coarse_cosines(query_fp, matrix, chunk=65536, threads=None):
+    """Dot every (fp16) fingerprint row with the query, chunked across threads.
+
+    The fp16->fp32 conversion and matrix-vector product release the GIL, so
+    threads scale this memory-bound scan (one thread took ~70 s over 11M rows).
+    """
     query_fp = np.asarray(query_fp, dtype=np.float32)
     values = np.empty(len(matrix), dtype=np.float32)
-    for start in range(0, len(matrix), chunk):
+
+    def run(start):
         values[start:start + chunk] = np.asarray(matrix[start:start + chunk], dtype=np.float32) @ query_fp
+
+    starts = range(0, len(matrix), chunk)
+    threads = min(16, os.cpu_count() or 1) if threads is None else int(threads)
+    if threads <= 1 or len(starts) <= 1:
+        for start in starts:
+            run(start)
+    else:
+        with ThreadPoolExecutor(max_workers=min(threads, len(starts))) as pool:
+            list(pool.map(run, starts))
     return values
 
 

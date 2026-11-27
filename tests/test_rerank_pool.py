@@ -74,3 +74,13 @@ def test_hard_prefilter_matches_full_evaluation():
         want = _reference_prefilter(q, cand, limits)
         assert got.dtype == bool and np.array_equal(got, want)
         assert 0 < got.sum() < n
+
+
+def test_threaded_coarse_cosines_match_serial():
+    rng = np.random.default_rng(2)
+    matrix = rng.standard_normal((1000, 64)).astype(np.float16)
+    query = rng.standard_normal(64).astype(np.float32)
+    serial = retrieval._coarse_cosines(query, matrix, chunk=97, threads=1)
+    threaded = retrieval._coarse_cosines(query, matrix, chunk=97, threads=4)
+    np.testing.assert_array_equal(serial, threaded)
+    np.testing.assert_allclose(serial, matrix.astype(np.float32) @ query, rtol=1e-5, atol=1e-4)
