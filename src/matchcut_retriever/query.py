@@ -111,6 +111,8 @@ def build_parser():
     parser.add_argument("--max-rot", type=float)
     parser.add_argument("--coarse-n", type=int)
     parser.add_argument("--hard-coarse-n", type=int)
+    parser.add_argument("--coarse-method", choices=("auto", "exact", "pca"))
+    parser.add_argument("--pca-shortlist-factor", type=int)
     parser.add_argument("--workers", type=int)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--out", required=True)
@@ -118,6 +120,7 @@ def build_parser():
     parser.add_argument("--retrieval-config", default=None, help="retrieval TOML")
     parser.add_argument("--no-clip", action="store_true")
     parser.add_argument("--library-root")
+    parser.add_argument("--preload", action="store_true", help="load shape fingerprints and masks into RAM")
     return parser
 
 
@@ -159,12 +162,12 @@ def main(argv=None):
     if not args.no_clip:
         from .models import ClipEmbedder
         clip_vector = ClipEmbedder(device=args.device, cache_dir=(paths.hf_cache if paths else None)).embed_masked([prepared], [mask])[0]
-    config = override_config(config, min_scale=args.min_scale, max_scale=args.max_scale, max_translate_frac=args.max_translate, max_rot_deg=args.max_rot, coarse_n=args.coarse_n, hard_coarse_n=args.hard_coarse_n, workers=args.workers, k=args.k, semantic_weight=semantic)
+    config = override_config(config, min_scale=args.min_scale, max_scale=args.max_scale, max_translate_frac=args.max_translate, max_rot_deg=args.max_rot, coarse_n=args.coarse_n, hard_coarse_n=args.hard_coarse_n, coarse_method=args.coarse_method, pca_shortlist_factor=args.pca_shortlist_factor, workers=args.workers, k=args.k, semantic_weight=semantic)
     if args.library_root:
         library_root = Path(args.library_root)
     else:
         library_root = paths.library_root
-    library = Library.load(library_root)
+    library = Library.load(library_root, preload=args.preload)
     query = QueryObject.from_mask(prepared, mask, clip_vector)
     results = rank(library, query, args.mode, semantic_weight=semantic, k=config.k, params=config)
     render_results(prepared, mask, results, library, out / "grid.jpg")
@@ -175,7 +178,8 @@ def main(argv=None):
     payload = {
         "query": {"image": str(args.image), "prepared": bool(args.prepared), "x": float(x), "y": float(y), "mask_index": args.mask_index, "height": int(prepared.shape[0]), "width": int(prepared.shape[1]), "area_frac": float(mask.mean()), "candidates": candidates},
         "warnings": warnings,
-        "parameters": {"mode": args.mode, "semantic_weight": semantic, "k": config.k, "coarse_n": config.coarse_n, "hard_coarse_n": config.hard_coarse_n, "workers": config.workers, "hard_axis_ecc_threshold": config.hard_axis_ecc_threshold, "hard_axis_margin_deg": config.hard_axis_margin_deg,"hard_limits": config.hard_limits.__dict__, "soft_params": config.soft_params.__dict__},
+        "parameters": {"mode": args.mode, "semantic_weight": semantic, "k": config.k, "coarse_n": config.coarse_n, "hard_coarse_n": config.hard_coarse_n, "coarse_method": config.coarse_method, "pca_shortlist_factor": config.pca_shortlist_factor, "workers": config.workers, "hard_axis_ecc_threshold": config.hard_axis_ecc_threshold, "hard_axis_margin_deg": config.hard_axis_margin_deg,"hard_limits": config.hard_limits.__dict__, "soft_params": config.soft_params.__dict__},
+        "coarse_method": results.coarse_method,
         "timings": results.timings,
         "results": [item.to_dict() for item in results],
     }

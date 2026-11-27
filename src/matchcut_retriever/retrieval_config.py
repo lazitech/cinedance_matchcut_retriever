@@ -22,6 +22,17 @@ class RetrievalConfig:
     # Principal-axis estimates are noisy (several degrees under small edits),
     # so the axis exclusion only drops candidates beyond max_rot_deg + margin.
     hard_axis_margin_deg: float = 10.0
+    coarse_method: str = "auto"
+    pca_shortlist_factor: int = 20
+
+    def __post_init__(self):
+        method = str(self.coarse_method).lower()
+        if method not in {"auto", "exact", "pca"}:
+            raise ValueError("coarse_method must be one of auto, exact, pca")
+        if int(self.pca_shortlist_factor) < 1:
+            raise ValueError("pca_shortlist_factor must be >= 1")
+        object.__setattr__(self, "coarse_method", method)
+        object.__setattr__(self, "pca_shortlist_factor", int(self.pca_shortlist_factor))
 
     @property
     def min_scale(self): return self.hard_limits.min_scale
@@ -48,6 +59,12 @@ def load_retrieval_config(path: str | Path | None = None) -> RetrievalConfig:
     soft_names = {field.name for field in fields(SoftParams)}
     hard = HardLimits(**{name: hard_values.get(name, values.get(name)) for name in hard_names if name in hard_values or name in values})
     soft = SoftParams(**{name: soft_values.get(name, values.get(name)) for name in soft_names if name in soft_values or name in values})
+    method = str(values.get("coarse_method", "auto")).lower()
+    if method not in {"auto", "exact", "pca"}:
+        raise ValueError("coarse_method must be one of auto, exact, pca")
+    factor = int(values.get("pca_shortlist_factor", 20))
+    if factor < 1:
+        raise ValueError("pca_shortlist_factor must be >= 1")
     return RetrievalConfig(
         hard_limits=hard,
         soft_params=soft,
@@ -58,6 +75,8 @@ def load_retrieval_config(path: str | Path | None = None) -> RetrievalConfig:
         semantic_weight=float(values.get("semantic_weight", 0.0)),
         hard_axis_ecc_threshold=float(values.get("hard_axis_ecc_threshold", 0.8)),
         hard_axis_margin_deg=max(0.0, float(values.get("hard_axis_margin_deg", 10.0))),
+        coarse_method=method,
+        pca_shortlist_factor=factor,
     )
 
 
@@ -71,7 +90,15 @@ def override_config(config: RetrievalConfig, **kwargs) -> RetrievalConfig:
         hard = replace(hard, **hard_updates)
     if soft_updates:
         soft = replace(soft, **soft_updates)
-    updates = {name: kwargs[name] for name in ("coarse_n", "hard_coarse_n", "workers", "k", "semantic_weight", "hard_axis_ecc_threshold", "hard_axis_margin_deg") if kwargs.get(name) is not None}
+    updates = {name: kwargs[name] for name in ("coarse_n", "hard_coarse_n", "workers", "k", "semantic_weight", "hard_axis_ecc_threshold", "hard_axis_margin_deg", "coarse_method", "pca_shortlist_factor") if kwargs.get(name) is not None}
+    if "coarse_method" in updates:
+        updates["coarse_method"] = str(updates["coarse_method"]).lower()
+        if updates["coarse_method"] not in {"auto", "exact", "pca"}:
+            raise ValueError("coarse_method must be one of auto, exact, pca")
+    if "pca_shortlist_factor" in updates:
+        updates["pca_shortlist_factor"] = int(updates["pca_shortlist_factor"])
+        if updates["pca_shortlist_factor"] < 1:
+            raise ValueError("pca_shortlist_factor must be >= 1")
     return replace(config, hard_limits=hard, soft_params=soft, **updates)
 
 
