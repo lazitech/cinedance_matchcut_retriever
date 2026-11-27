@@ -19,6 +19,33 @@ from .retrieval import Library, QueryObject, rank
 from .retrieval_config import load_retrieval_config, override_config
 
 
+def cut_shot_clip(source, start_s: float, end_s: float, target, error_out=None) -> bool:
+    """Cut and encode a shot clip atomically with ffmpeg."""
+    source, target = Path(source), Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=target.stem + ".", suffix=".mp4", dir=target.parent)
+    os.close(fd)
+    temp = Path(temp_name)
+    try:
+        cmd = ["ffmpeg", "-y", "-ss", str(max(0.0, float(start_s))), "-i", str(source),
+               "-t", str(max(0.01, float(end_s) - float(start_s))), "-vf",
+               "scale=w='if(gt(iw,ih),min(640,iw),-2)':h='if(gt(iw,ih),-2,min(640,ih))'",
+               "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+               "-c:a", "aac", "-movflags", "+faststart", str(temp)]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        if proc.returncode != 0 or not temp.is_file() or temp.stat().st_size == 0:
+            if error_out is not None:
+                error_out.append(proc.stderr.decode(errors="replace")[-300:])
+            return False
+        os.replace(temp, target)
+        return True
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+
+
 @dataclass(frozen=True)
 class Candidate:
     """A SAM candidate in prepared-image coordinates."""
@@ -178,61 +205,21 @@ class QueryEngine:
         target = cache_dir / f"{clip_id}_{int(shot_no)}.mp4"
         if target.is_file() and target.stat().st_size > 0:
             return str(target)
-        fd, temp_name = tempfile.mkstemp(prefix=target.stem + ".", suffix=".mp4", dir=cache_dir)
-        os.close(fd)
-        temp = Path(temp_name)
-        try:
-            cmd = ["ffmpeg", "-y", "-ss", str(max(0.0, start)), "-i", str(source),
-                   "-t", str(max(0.01, end - start)), "-vf",
-                   "scale=w='if(gt(iw,ih),min(640,iw),-2)':h='if(gt(iw,ih),-2,min(640,ih))'",
-                   "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-                   "-c:a", "aac", "-movflags", "+faststart", str(temp)]
-            proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
-            if proc.returncode != 0 or not temp.is_file() or temp.stat().st_size == 0:
-                self.last_message = f"ffmpeg failed for {clip_id} shot {shot_no}: {proc.stderr.decode(errors='replace')[-300:]}"
-                return None
-            os.replace(temp, target)
-            return str(target)
-        finally:
-            try:
-                temp.unlink()
-            except FileNotFoundError:
-                pass
+        errors = []
+        if not cut_shot_clip(source, start, end, target, errors):
+            detail = errors[0] if errors else ""
+            self.last_message = f"ffmpeg failed for {clip_id} shot {shot_no}: {detail}".rstrip()
+            return None
+        return str(target)
 
 
-__all__ = ["Candidate", "QueryEngine"]
+__all__ = ["Candidate", "QueryEngine", "cut_shot_clip"]
 
 
 def _result_gallery_item(engine, prepared, query_mask, result, rank: int):
     """Build a compact candidate/overlay panel for the Gradio gallery."""
-    import cv2
-    from PIL import Image
-    from .shape import cover_fit_matrix
-    from .render import _outline
-    candidate = np.asarray(Image.open(engine.library.keyframe_path(result.keyframe_id)).convert("RGB"))
-    cmask = engine.library.mask(result.object_id)
-    cand = _outline(candidate, cmask, (255, 170, 40))
-    q = np.asarray(prepared, dtype=np.uint8)
-    cover = cover_fit_matrix((candidate.shape[1], candidate.shape[0]), (q.shape[1], q.shape[0]))
-    # Compose the candidate cover-fit with the result's affine transform in
-    # homogeneous coordinates before passing the 2x3 matrix to OpenCV.
-    cover_h = np.vstack([cover, [0, 0, 1]])
-    transform_h = np.vstack([result.transform.matrix((q.shape[1], q.shape[0])), [0, 0, 1]])
-    mat = (transform_h @ cover_h)[:2]
-    aligned = cv2.warpAffine(candidate, mat, (q.shape[1], q.shape[0]), borderValue=(25, 25, 25))
-    warped = cv2.warpAffine(cmask.astype(np.uint8), mat, (q.shape[1], q.shape[0]), flags=cv2.INTER_NEAREST).astype(bool)
-    overlay = cv2.addWeighted(q, 0.5, aligned, 0.5, 0)
-    overlay = _outline(_outline(overlay, query_mask, (50, 220, 80)), warped, (255, 70, 60))
-    height = 220
-    def fit(im):
-        scale = min(320 / im.shape[1], height / im.shape[0])
-        small = cv2.resize(im, (max(1, round(im.shape[1]*scale)), max(1, round(im.shape[0]*scale))))
-        out = np.full((height, 320, 3), 25, dtype=np.uint8)
-        y, x = (height-small.shape[0])//2, (320-small.shape[1])//2
-        out[y:y+small.shape[0], x:x+small.shape[1]] = small
-        return out
-    # Stack vertically: Gradio gallery cells are square, so a wide strip wastes most of the cell.
-    panel = np.concatenate([fit(cand), fit(overlay)], axis=0)
+    from .render import result_panel
+    panel = result_panel(engine.library, prepared, query_mask, result)
     caption = f"#{rank} {result.clip_id[:12]}… shot {result.shot_no}"
     if result.start_s is not None and result.end_s is not None:
         caption += f" [{result.start_s:.2f}-{result.end_s:.2f}s]"
@@ -400,7 +387,7 @@ def main(argv=None):
     return 0
 
 
-__all__ = ["Candidate", "QueryEngine", "build_app", "main"]
+__all__ = ["Candidate", "QueryEngine", "build_app", "cut_shot_clip", "main"]
 
 
 if __name__ == "__main__":

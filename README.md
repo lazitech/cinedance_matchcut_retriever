@@ -62,3 +62,23 @@ python3 scripts/proxy_run.py -- .venv/bin/python -m matchcut_retriever.app --con
 
 The proxy is temporary and stays up only while the wrapped app process is running; stop the app
 to stop the proxy.
+
+## Human evaluation
+
+The human-evaluation tool compares the soft and hard ranking modes with a blind Gradio labeling
+workflow. Write a TOML query spec containing one `[[query]]` entry per subject (image path, click
+coordinates, optional `mask_index`, `group`, `exclude_clips`, and `note`), then run:
+
+```bash
+.venv/bin/python -m matchcut_retriever.human_eval prepare --spec queries.toml --out outputs/eval --config configs/local.toml --device cpu
+.venv/bin/python -m matchcut_retriever.human_eval pool --out outputs/eval --config configs/local.toml --k 10 --modes soft,hard
+.venv/bin/python -m matchcut_retriever.human_eval annotate --out outputs/eval --config configs/local.toml
+.venv/bin/python -m matchcut_retriever.human_eval report --out outputs/eval --k 10
+```
+
+`prepare` stores the resized query image, selected mask, candidate preview, and `queries.json`.
+`pool` writes mode-specific rankings to `rankings.json`, and a shuffled blind candidate list plus
+rendered panels to `items.json` and `panels/`. The annotation page stores labels atomically in
+`labels.json`; each query records `usable`, `judged`, `note`, and `saved_at`. `report` reads only
+saved labels and writes `report.json` and `report.md`, including P@K, Hit@K, group breakdowns,
+returned-count precision, per-query counts, mode overlap, and unjudged items.
