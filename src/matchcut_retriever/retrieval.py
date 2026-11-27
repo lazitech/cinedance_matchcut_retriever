@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from .masks import rle_decode
+from .memory import disable_transparent_hugepages
 from .parquet_io import read_parquet_buffered
 from .library import _pca_status, pca_files
 from .retrieval_config import RetrievalConfig, load_retrieval_config
@@ -164,6 +165,8 @@ class Library:
     @classmethod
     def load(cls, root: str | Path, preload: bool = False) -> "Library":
         root = Path(root)
+        # Must precede the multi-GB allocations below (see memory.py).
+        disable_transparent_hugepages()
         objects = read_parquet_buffered(root / "objects.parquet")
         meta_path = root / "index" / "meta.json"
         import json
