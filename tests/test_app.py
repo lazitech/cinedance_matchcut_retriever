@@ -144,8 +144,13 @@ def test_build_app_with_injected_engine_does_not_launch(tmp_path):
 def test_main_configures_and_launches_app(monkeypatch):
     calls = {}
 
+    class FakeEngine:
+        def warm_up(self):
+            calls["warm_up"] = calls.get("warm_up", 0) + 1
+
     class FakeApp:
         matchcut_allowed_paths = ["/tmp/library/cache/shot_clips"]
+        matchcut_engine = FakeEngine()
 
         def queue(self):
             calls["queued"] = True
@@ -164,6 +169,21 @@ def test_main_configures_and_launches_app(monkeypatch):
     assert calls["queued"] is True
     assert calls["launch"] == {"server_name": "0.0.0.0", "server_port": 8123, "share": True,
                                "allowed_paths": ["/tmp/library/cache/shot_clips"]}
+    # Models are loaded before serving so the first click does not pay the cold start.
+    assert calls["warm_up"] == 1
+    assert app_module.main(["--library-root", "/tmp/library", "--no-warmup"]) == 0
+    assert calls["warm_up"] == 1
+
+
+def test_warm_up_loads_sam_and_clip(tmp_path, monkeypatch):
+    engine = _engine(tmp_path)
+    engine._sam = engine._clip = None
+    loaded = []
+    import matchcut_retriever.models as models
+    monkeypatch.setattr(models, "SamPointSegmenter", lambda **kw: loaded.append("sam") or "sam")
+    monkeypatch.setattr(models, "ClipEmbedder", lambda **kw: loaded.append("clip") or "clip")
+    engine.warm_up()
+    assert loaded == ["sam", "clip"]
 
 
 def test_gradio_temp_dir_defaults_to_per_user_folder(tmp_path, monkeypatch):

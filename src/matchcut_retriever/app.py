@@ -81,6 +81,12 @@ class QueryEngine:
                 self._clip = ClipEmbedder(device=self.device, cache_dir=cache)
         return self._clip
 
+    def warm_up(self) -> None:
+        """Load SAM and CLIP now; a cold load on the first click can take
+        over 40 s on CPU and made the first request fail through the share link."""
+        _ = self.sam
+        _ = self.clip
+
     @staticmethod
     def _array(image) -> np.ndarray:
         if isinstance(image, (str, os.PathLike)):
@@ -360,6 +366,7 @@ def build_app(engine: QueryEngine | None = None, **engine_kwargs):
         gallery.select(on_result, [result_state], [breakdown, video])
     # Gradio only serves files from cwd/temp unless the directory is allowed at launch.
     app.matchcut_allowed_paths = [str(engine.video_cache_dir)]
+    app.matchcut_engine = engine
     return app
 
 
@@ -374,8 +381,11 @@ def main(argv=None):
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--share", action="store_true")
     parser.add_argument("--preload", action="store_true", help="load shape fingerprints and masks into RAM")
+    parser.add_argument("--no-warmup", action="store_true", help="load SAM/CLIP lazily on the first request instead of at startup")
     args = parser.parse_args(argv)
     app = build_app(library_root=args.library_root, config=args.config, retrieval_config=args.retrieval_config, device=args.device, preload=args.preload)
+    if not args.no_warmup:
+        app.matchcut_engine.warm_up()
     launch_kwargs = {"server_name": args.host, "server_port": args.port, "share": args.share}
     allowed = getattr(app, "matchcut_allowed_paths", None)
     if allowed:
