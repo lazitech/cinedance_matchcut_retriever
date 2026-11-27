@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from .masks import rle_decode
+from .library import _pca_status
 from .retrieval_config import RetrievalConfig, load_retrieval_config
 from .shape import (
     FINGERPRINT_DIM,
@@ -149,7 +150,7 @@ class Library:
         self.pca_status = pca_status
         self.pca_status_reason = pca_status_reason
         self._geometry_cache = {
-            name: self.objects[name].to_numpy(dtype=np.float32, copy=True)
+            name: self.objects[name].to_numpy(copy=True)
             for name in ("frame_w", "frame_h", "cx", "cy", "area", "eccentricity", "angle")
             if name in self.objects
         }
@@ -160,7 +161,7 @@ class Library:
         self.shot_lookup = self._shot_by_id
 
     @classmethod
-    def load(cls, root: str | Path) -> "Library":
+    def load(cls, root: str | Path, preload: bool = False) -> "Library":
         root = Path(root)
         objects = pd.read_parquet(root / "objects.parquet")
         meta_path = root / "index" / "meta.json"
@@ -184,6 +185,8 @@ class Library:
                 raise ValueError(f"{path.name} shape does not match metadata")
             return arr
         shape_fp = mmap_npy(root / "index" / "shape_fp.npy")
+        if preload:
+            shape_fp = np.asarray(np.load(root / "index" / "shape_fp.npy"), dtype=np.float16)
         clip_emb = mmap_npy(root / "index" / "clip_emb.npy")
         if shape_fp.ndim != 2 or shape_fp.shape[1] != int(meta.get("fingerprint_dim", shape_fp.shape[1])):
             raise ValueError("shape fingerprint dimension does not match meta.json")
@@ -195,6 +198,8 @@ class Library:
         # np.memmap cannot map an empty file (a library whose build kept no objects).
         has_masks = masks_path.is_file() and masks_path.stat().st_size > 0
         masks_bin = np.memmap(masks_path, mode="r", dtype=np.uint8) if has_masks else np.empty(0, dtype=np.uint8)
+        if preload and has_masks:
+            masks_bin = np.fromfile(masks_path, dtype=np.uint8)
         if "mask_offset" in objects and "mask_nbytes" in objects:
             ends = objects.mask_offset.to_numpy(dtype=np.int64) + objects.mask_nbytes.to_numpy(dtype=np.int64)
             if len(ends) and (np.any(objects.mask_offset.to_numpy(dtype=np.int64) < 0) or np.max(ends) > len(masks_bin)):
@@ -206,24 +211,15 @@ class Library:
         pca_status = "absent"
         pca_reason = "metadata missing"
         pca_meta_path = root / "index" / "shape_pca.json"
-        if pca_meta_path.is_file():
+        pca_state, pca_reason = _pca_status(root, meta)
+        if pca_state == "valid":
             try:
                 pmeta = json.loads(pca_meta_path.read_text())
                 dim = int(pmeta["dim"])
-                if int(pmeta.get("n_objects")) != n:
-                    raise ValueError("n_objects mismatch")
-                if str(pmeta.get("fingerprint_version")) != FINGERPRINT_VERSION:
-                    raise ValueError("fingerprint_version mismatch")
-                if pmeta.get("generation") != meta.get("generation"):
-                    raise ValueError("generation mismatch")
-                if dim < 1 or dim > shape_fp.shape[1]:
-                    raise ValueError("invalid dim")
                 pca_path = root / "index" / "shape_pca.npy"
                 basis_path = root / "index" / "shape_pca_basis.npy"
                 shape_pca = np.asarray(np.load(pca_path), dtype=np.float32)
                 basis = np.asarray(np.load(basis_path), dtype=np.float32)
-                if shape_pca.shape != (n, dim) or basis.shape != (shape_fp.shape[1], dim):
-                    raise ValueError("array shape mismatch")
                 shape_pca = np.ascontiguousarray(shape_pca)
                 basis = np.ascontiguousarray(basis)
                 pca_status = "valid"
@@ -232,6 +228,9 @@ class Library:
                 pca_status = "stale"
                 pca_reason = str(exc)
                 LOGGER.warning("stale PCA index at %s: %s", root, exc)
+        elif pca_state == "stale":
+            pca_status, pca_reason = "stale", pca_reason
+            LOGGER.warning("stale PCA index at %s: %s", root, pca_reason)
         return cls(root, objects, masks_bin, shape_fp, clip_emb, meta, keyframes, shots,
                    shape_pca, basis, pca_status, pca_reason)
 
@@ -360,6 +359,7 @@ def rank(library: Library, query: QueryObject, mode: str = "soft", semantic_weig
     rescore_time = 0.0
     if method == "pca":
         pca_started = time.perf_counter()
+        # Raw reduced dots estimate the exact cosine; normalizing would rank by projected cosine.
         qproj = np.asarray(query.fingerprint, dtype=np.float32) @ library.pca_basis
         pca_scores = np.asarray(library.shape_pca @ qproj, dtype=np.float32)
         shortlist_n = min(len(survivor_ids), int(config.pca_shortlist_factor) * int(coarse_n))

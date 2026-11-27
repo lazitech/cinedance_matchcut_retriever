@@ -696,7 +696,8 @@ def build_pca(root, dim: int = 128, sample: int = 200_000, seed: int = 0) -> dic
     sample_n = min(sample, n_objects)
     if sample_n:
         rng = np.random.default_rng(int(seed))
-        indices = rng.choice(n_objects, size=sample_n, replace=False)
+        # Gather sorted rows to avoid random-read storms on the spinning-disk index.
+        indices = np.sort(rng.choice(n_objects, size=sample_n, replace=False))
         sampled = np.asarray(shape_fp[indices], dtype=np.float32)
         second = (sampled.T @ sampled) / float(sample_n)
         eigenvalues, eigenvectors = np.linalg.eigh(second)

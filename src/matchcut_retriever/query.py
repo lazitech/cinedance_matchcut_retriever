@@ -120,6 +120,7 @@ def build_parser():
     parser.add_argument("--retrieval-config", default=None, help="retrieval TOML")
     parser.add_argument("--no-clip", action="store_true")
     parser.add_argument("--library-root")
+    parser.add_argument("--preload", action="store_true", help="load shape fingerprints and masks into RAM")
     return parser
 
 
@@ -166,7 +167,7 @@ def main(argv=None):
         library_root = Path(args.library_root)
     else:
         library_root = paths.library_root
-    library = Library.load(library_root)
+    library = Library.load(library_root, preload=args.preload)
     query = QueryObject.from_mask(prepared, mask, clip_vector)
     results = rank(library, query, args.mode, semantic_weight=semantic, k=config.k, params=config)
     render_results(prepared, mask, results, library, out / "grid.jpg")

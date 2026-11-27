@@ -221,11 +221,11 @@ def _markdown(summary: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def run_selftest(library_root: str | Path, out: str | Path, n: int = 200, seed: int = 0, mask_source: str = "both", modes: Iterable[str] = ("soft", "hard"), k_max: int = 50, semantic: float = 0.0, config_path: str | Path | None = None, retrieval_config: str | Path | None = None, device: str = "cuda:0", workers: int | None = None, coarse_n: int | None = None, hard_coarse_n: int | None = None, coarse_method: str | None = None, pca_shortlist_factor: int | None = None, shard: str | None = None, point_segmenter: Any = None, embedder: Any = None, render_failures: int = 0) -> dict[str, Any]:
+def run_selftest(library_root: str | Path, out: str | Path, n: int = 200, seed: int = 0, mask_source: str = "both", modes: Iterable[str] = ("soft", "hard"), k_max: int = 50, semantic: float = 0.0, config_path: str | Path | None = None, retrieval_config: str | Path | None = None, device: str = "cuda:0", workers: int | None = None, coarse_n: int | None = None, hard_coarse_n: int | None = None, coarse_method: str | None = None, pca_shortlist_factor: int | None = None, preload: bool = False, shard: str | None = None, point_segmenter: Any = None, embedder: Any = None, render_failures: int = 0) -> dict[str, Any]:
     """Run or resume the self-test and write summary.json/summary.md."""
     root, out = Path(library_root), Path(out)
     out.mkdir(parents=True, exist_ok=True)
-    library = Library.load(root)
+    library = Library.load(root, preload=preload)
     shard_index, shard_count = 0, 1
     if shard:
         left, right = str(shard).split("/", 1); shard_index, shard_count = int(left), int(right)
@@ -316,7 +316,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", required=True); parser.add_argument("--n", type=int, default=200); parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mask-source", choices=("sam", "gt", "both"), default="both"); parser.add_argument("--modes", default="soft,hard"); parser.add_argument("--k-max", type=int, default=50)
     parser.add_argument("--semantic", type=float, default=0.0); parser.add_argument("--device", default="cuda:0"); parser.add_argument("--workers", type=int); parser.add_argument("--coarse-n", type=int); parser.add_argument("--hard-coarse-n", type=int); parser.add_argument("--coarse-method", choices=("auto", "exact", "pca")); parser.add_argument("--pca-shortlist-factor", type=int)
-    parser.add_argument("--shard"); parser.add_argument("--summarize-only", action="store_true"); parser.add_argument("--render-failures", type=int, default=0)
+    parser.add_argument("--preload", action="store_true", help="load shape fingerprints and masks into RAM"); parser.add_argument("--shard"); parser.add_argument("--summarize-only", action="store_true"); parser.add_argument("--render-failures", type=int, default=0)
     return parser
 
 
@@ -327,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
         summary = summarize_records(_load_records(out)); (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n"); (out / "summary.md").write_text(_markdown(summary)); print((out / "summary.md").read_text(), end=""); return 0
     if not args.library_root:
         args.library_root = str(load_paths(args.config).library_root)
-    run_selftest(args.library_root, out, n=args.n, seed=args.seed, mask_source=args.mask_source, modes=args.modes.split(","), k_max=args.k_max, semantic=args.semantic, config_path=args.config, retrieval_config=args.retrieval_config, device=args.device, workers=args.workers, coarse_n=args.coarse_n, hard_coarse_n=args.hard_coarse_n, coarse_method=args.coarse_method, pca_shortlist_factor=args.pca_shortlist_factor, shard=args.shard, render_failures=args.render_failures)
+    run_selftest(args.library_root, out, n=args.n, seed=args.seed, mask_source=args.mask_source, modes=args.modes.split(","), k_max=args.k_max, semantic=args.semantic, config_path=args.config, retrieval_config=args.retrieval_config, device=args.device, workers=args.workers, coarse_n=args.coarse_n, hard_coarse_n=args.hard_coarse_n, coarse_method=args.coarse_method, pca_shortlist_factor=args.pca_shortlist_factor, preload=args.preload, shard=args.shard, render_failures=args.render_failures)
     return 0
 
 

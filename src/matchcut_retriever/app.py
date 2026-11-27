@@ -37,7 +37,7 @@ class QueryEngine:
     """Thread-safe, lazy model wrapper used by the Gradio front end."""
 
     def __init__(self, library_root=None, config=None, retrieval_config=None,
-                 device: str = "cpu", sam=None, clip=None, paths=None):
+                 device: str = "cpu", sam=None, clip=None, paths=None, preload: bool = False):
         self.device = device
         self._path_message: str | None = None
         self.paths = paths
@@ -55,7 +55,7 @@ class QueryEngine:
                 self.paths = load_paths(config)
             library_root = self.paths.library_root
         self.library_root = Path(library_root)
-        self.library = Library.load(self.library_root)
+        self.library = Library.load(self.library_root, preload=preload)
         self.config = load_retrieval_config(retrieval_config)
         self._sam = sam
         self._clip = clip
@@ -373,8 +373,9 @@ def main(argv=None):
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--share", action="store_true")
+    parser.add_argument("--preload", action="store_true", help="load shape fingerprints and masks into RAM")
     args = parser.parse_args(argv)
-    app = build_app(library_root=args.library_root, config=args.config, retrieval_config=args.retrieval_config, device=args.device)
+    app = build_app(library_root=args.library_root, config=args.config, retrieval_config=args.retrieval_config, device=args.device, preload=args.preload)
     launch_kwargs = {"server_name": args.host, "server_port": args.port, "share": args.share}
     allowed = getattr(app, "matchcut_allowed_paths", None)
     if allowed:

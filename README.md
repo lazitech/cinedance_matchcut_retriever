@@ -40,6 +40,9 @@ After object extraction, consolidate the parts and build the PCA shortlist index
 Every `consolidate` creates a new index generation, which makes an older PCA index stale. Re-run
 the `pca` command after consolidating before using PCA coarse search.
 
+For the full library, pass `--preload` to the query, app, or self-test command to keep fingerprints
+and masks in RAM (about 29 GB, plus PCA projections).
+
 ## Gradio UI
 
 Queries load SAM and CLIP, so run the UI on the GPU server with both extras installed
