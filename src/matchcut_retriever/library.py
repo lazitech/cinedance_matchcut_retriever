@@ -22,6 +22,7 @@ import pandas as pd
 from .config import load_paths
 from .framing import frame_quality
 from .masks import rle_decode, rle_encode
+from .parquet_io import ROW_GROUP_ROWS, read_parquet_buffered
 from .models import Detection, ClipEmbedder, PanopticSegmenter, SamAutoSegmenter
 from .models.common import filter_detections
 from .shape import (
@@ -530,6 +531,15 @@ def consolidate(root) -> dict[str, Any]:
             pa.field("mask_nbytes", pa.int32()),
         ])
         writer = pq.ParquetWriter(temp / "objects.parquet", schema=schema)
+        # Batch parts into large row groups (see parquet_io.ROW_GROUP_ROWS).
+        pending: list[pa.Table] = []
+        pending_rows = 0
+
+        def _flush_pending() -> None:
+            nonlocal pending, pending_rows
+            if pending:
+                writer.write_table(pa.concat_tables(pending), row_group_size=ROW_GROUP_ROWS)
+            pending, pending_rows = [], 0
         mask_output = index / "masks.bin"
         sample_rows: list[tuple[int, int, int, int, int]] = []
         mask_base = 0
@@ -571,8 +581,10 @@ def consolidate(root) -> dict[str, Any]:
                         int(record.object_id), int(record.mask_offset), int(record.mask_nbytes),
                         int(record.frame_h), int(record.frame_w),
                     ))
-            table = pa.Table.from_pandas(part[OBJECT_COLUMNS], schema=schema, preserve_index=False)
-            writer.write_table(table)
+            pending.append(pa.Table.from_pandas(part[OBJECT_COLUMNS], schema=schema, preserve_index=False))
+            pending_rows += len(part)
+            if pending_rows >= ROW_GROUP_ROWS:
+                _flush_pending()
             with (part_dir / "masks.bin").open("rb") as source, mask_output.open("ab") as destination:
                 while True:
                     chunk = source.read(8 * 1024 * 1024)
@@ -580,6 +592,7 @@ def consolidate(root) -> dict[str, Any]:
                         break
                     destination.write(chunk)
             mask_base += descriptor["mask_bytes"]
+        _flush_pending()
         shape_mem.flush()
         clip_mem.flush()
         del shape_mem, clip_mem
@@ -975,7 +988,7 @@ def neighbours(root, n: int = 12, k: int = 8, seed: int = 0, out=None) -> list[P
     root = Path(root)
     out_dir = Path(out) if out is not None else root / "neighbours"
     out_dir.mkdir(parents=True, exist_ok=True)
-    objects = pd.read_parquet(root / "objects.parquet")
+    objects = read_parquet_buffered(root / "objects.parquet")
     fingerprints = np.asarray(np.load(root / "index" / "shape_fp.npy"), dtype=np.float32)
     if len(objects) == 0:
         return []
@@ -1030,7 +1043,7 @@ def _summary(root: Path) -> dict[str, Any]:
         return {"objects": 0, "clips": 0, "keyframes": 0, "skipped_keyframes": 0,
                 "fingerprint_version": _fingerprint_version(meta), "pca_status": pca_state,
                 "pca_reason": pca_reason, "bytes": {}}
-    frame = pd.read_parquet(objects_path)
+    frame = read_parquet_buffered(objects_path)
     keyframes = int(frame["keyframe_id"].nunique()) if len(frame) else 0
     clips = int(frame["clip_id"].nunique()) if len(frame) else 0
     bytes_map = {}

@@ -14,6 +14,7 @@ import numpy as np
 import pandas as pd
 
 from .masks import rle_decode
+from .parquet_io import read_parquet_buffered
 from .library import _pca_status, pca_files
 from .retrieval_config import RetrievalConfig, load_retrieval_config
 from .shape import (
@@ -163,7 +164,7 @@ class Library:
     @classmethod
     def load(cls, root: str | Path, preload: bool = False) -> "Library":
         root = Path(root)
-        objects = pd.read_parquet(root / "objects.parquet")
+        objects = read_parquet_buffered(root / "objects.parquet")
         meta_path = root / "index" / "meta.json"
         import json
         meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
@@ -204,9 +205,9 @@ class Library:
             ends = objects.mask_offset.to_numpy(dtype=np.int64) + objects.mask_nbytes.to_numpy(dtype=np.int64)
             if len(ends) and (np.any(objects.mask_offset.to_numpy(dtype=np.int64) < 0) or np.max(ends) > len(masks_bin)):
                 raise ValueError("mask offsets exceed masks.bin")
-        keyframes = pd.read_parquet(root / "keyframes.parquet")
+        keyframes = read_parquet_buffered(root / "keyframes.parquet")
         shots_path = root / "shots.parquet"
-        shots = pd.read_parquet(shots_path) if shots_path.is_file() else pd.DataFrame(columns=["clip_id", "shot_no", "start_s", "end_s"])
+        shots = read_parquet_buffered(shots_path) if shots_path.is_file() else pd.DataFrame(columns=["clip_id", "shot_no", "start_s", "end_s"])
         shape_pca = basis = None
         pca_status = "absent"
         pca_reason = "metadata missing"
