@@ -150,3 +150,18 @@ def test_report_lists_unlabeled_queries_and_unjudged_items(tmp_path):
     assert "q2-item" in report["unjudged"]
     assert "Unlabeled queries" in (out / "report.md").read_text()
 
+
+
+def test_query_preview_outlines_mask(tmp_path):
+    from matchcut_retriever.human_eval import query_preview
+
+    qdir = tmp_path / "queries" / "q1"
+    qdir.mkdir(parents=True)
+    Image.fromarray(np.zeros((40, 60, 3), np.uint8)).save(qdir / "prepared.png")
+    mask = np.zeros((40, 60), np.uint8)
+    mask[10:30, 20:40] = 255
+    Image.fromarray(mask).save(qdir / "mask.png")
+    preview = query_preview(tmp_path, "q1")
+    assert preview.shape == (40, 60, 3)
+    # The outline is drawn on the mask boundary; the prepared image itself was black.
+    assert preview[10, 20:40].any() and not preview[0, 0].any()

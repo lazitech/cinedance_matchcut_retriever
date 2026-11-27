@@ -132,6 +132,20 @@ def save_labels(out, query_id, usable, judged, note=""):
         labels = _read_json(path, {}); labels[str(query_id)] = {"usable": list(usable), "judged": list(judged), "note": str(note), "saved_at": datetime.now(timezone.utc).isoformat()}; _atomic_json(path, labels)
     return labels[str(query_id)]
 
+def query_preview(out, query_id) -> np.ndarray:
+    """Return the prepared query image with its chosen mask outlined."""
+    qdir = Path(out) / "queries" / str(query_id)
+    # np.array (not asarray): PIL-backed arrays are read-only and cv2 draws in place.
+    prepared = np.array(Image.open(qdir / "prepared.png").convert("RGB"))
+    mask_path = qdir / "mask.png"
+    if mask_path.is_file():
+        import cv2
+        mask = np.asarray(Image.open(mask_path).convert("L")) > 0
+        contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            cv2.polylines(prepared, contours, True, (255, 70, 40), 3)
+    return prepared
+
 def build_annotation_app(out, config=None, host="127.0.0.1", port=7870, share=False):
     from .app import _ensure_gradio_temp_dir
     _ensure_gradio_temp_dir()
@@ -142,15 +156,7 @@ def build_annotation_app(out, config=None, host="127.0.0.1", port=7870, share=Fa
         session_index = gr.State(0)
         def show(i):
             i = max(0, min(int(i), len(queries)-1)); q = queries[i]; its = items.get(q["id"], []); lab = labels.get(q["id"], {}); saved_count = sum(1 for query in queries if query["id"] in labels); status = "saved" if q["id"] in labels else "unsaved"; header_v = f"query {i+1} / {len(queries)} · {saved_count} labeled · {status}"
-            prepared_path = out / "queries" / q["id"] / "prepared.png"
-            prepared = np.asarray(Image.open(prepared_path).convert("RGB"))
-            mask_path = out / "queries" / q["id"] / "mask.png"
-            if mask_path.is_file():
-                import cv2
-                mask = np.asarray(Image.open(mask_path).convert("L")) > 0
-                contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                if contours:
-                    cv2.polylines(prepared, contours, True, (255, 70, 40), 3)
+            prepared = query_preview(out, q["id"])
             return header_v, f"**{q.get('note','')}**  ·  {q.get('group','')}", prepared, [(str(out / x["panel"]), f"#{j+1}") for j,x in enumerate(its)], gr.update(choices=[f"#{j+1}" for j in range(len(its))], value=[f"#{j+1}" for j,x in enumerate(its) if x["item_id"] in lab.get("usable", [])]), lab.get("note", ""), q["id"], i
         def do_save(chosen, text, qid, i):
             its = items.get(qid, []); usable = [its[int(str(c)[1:]) - 1]["item_id"] for c in (chosen or [])]; save_labels(out, qid, usable, [x["item_id"] for x in its], text); labels.update(load_labels(out)); return show(min(int(i) + 1, len(queries)-1))
