@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, asdict, replace
 import logging
 import math
+import multiprocessing
+import threading
 from pathlib import Path
 import time
 from typing import Any
@@ -156,6 +159,9 @@ class Library:
             for name in ("frame_w", "frame_h", "cx", "cy", "area", "eccentricity", "angle")
             if name in self.objects
         }
+        has_offsets = "mask_offset" in self.objects and "mask_nbytes" in self.objects
+        self._mask_offset = self.objects.mask_offset.to_numpy(dtype=np.int64) if has_offsets else None
+        self._mask_nbytes = self.objects.mask_nbytes.to_numpy(dtype=np.int64) if has_offsets else None
         self._keyframe_by_id = {str(row.keyframe_id): row for row in keyframes.itertuples(index=False)}
         self._shot_by_id = {(str(row.clip_id), int(row.shot_no)): row for row in shots.itertuples(index=False)}
         # Public aliases make per-shot/keyframe metadata convenient for callers.
@@ -237,10 +243,17 @@ class Library:
         return cls(root, objects, masks_bin, shape_fp, clip_emb, meta, keyframes, shots,
                    shape_pca, basis, pca_status, pca_reason)
 
+    def mask_bytes(self, object_id: int) -> bytes:
+        """Return the object's RLE-encoded mask (decode with ``rle_decode``)."""
+        if self._mask_offset is None:
+            row = self.objects.iloc[int(object_id)]
+            start, length = int(row.mask_offset), int(row.mask_nbytes)
+        else:
+            start, length = int(self._mask_offset[int(object_id)]), int(self._mask_nbytes[int(object_id)])
+        return bytes(memoryview(self.masks_bin)[start:start + length])
+
     def mask(self, object_id: int) -> np.ndarray:
-        row = self.objects.iloc[int(object_id)]
-        start, length = int(row.mask_offset), int(row.mask_nbytes)
-        return rle_decode(memoryview(self.masks_bin)[start:start + length])
+        return rle_decode(self.mask_bytes(object_id))
 
     def geometry_arrays(self) -> dict[str, np.ndarray]:
         return {name: self._geometry_cache[name] for name in ("frame_w", "frame_h", "cx", "cy", "area")}
@@ -258,17 +271,62 @@ class Library:
         return self._keyframe_by_id.get(str(keyframe_id))
 
 
-def _match_worker(args):
-    query_mask, candidate_mask, mode, hard_limits, soft_params = args
-    return hard_match(query_mask, candidate_mask, hard_limits) if mode == "hard" else soft_match(query_mask, candidate_mask, soft_params)
+def _match_chunk(args):
+    """Decode RLE candidate masks and match each against the query mask."""
+    query_mask, blobs, mode, hard_limits, soft_params = args
+    results = []
+    for blob in blobs:
+        candidate = rle_decode(blob)
+        results.append(hard_match(query_mask, candidate, hard_limits) if mode == "hard"
+                       else soft_match(query_mask, candidate, soft_params))
+    return results
 
 
-def _rerank(query_mask, candidate_masks, mode, limits, soft_params, workers):
-    args = [(query_mask, mask, mode, limits, soft_params) for mask in candidate_masks]
-    if workers > 1 and len(args) >= 8:
-        with ProcessPoolExecutor(max_workers=int(workers)) as pool:
-            return list(pool.map(_match_worker, args))
-    return [_match_worker(arg) for arg in args]
+# A query used to create (and fork) a fresh process pool, which for a library
+# preloaded into tens of GB of RAM cost seconds per query. Keep one pool of
+# spawned workers per process instead; they import only the matching code.
+_POOL: ProcessPoolExecutor | None = None
+_POOL_WORKERS = 0
+_POOL_LOCK = threading.Lock()
+
+
+def _get_pool(workers: int) -> ProcessPoolExecutor:
+    global _POOL, _POOL_WORKERS
+    with _POOL_LOCK:
+        if _POOL is None or _POOL_WORKERS != workers:
+            if _POOL is not None:
+                _POOL.shutdown(wait=False, cancel_futures=True)
+            _POOL = ProcessPoolExecutor(max_workers=workers, mp_context=multiprocessing.get_context("spawn"))
+            _POOL_WORKERS = workers
+        return _POOL
+
+
+def _reset_pool(pool: ProcessPoolExecutor) -> None:
+    global _POOL, _POOL_WORKERS
+    with _POOL_LOCK:
+        if _POOL is pool:
+            _POOL, _POOL_WORKERS = None, 0
+    pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _rerank(query_mask, candidate_blobs, mode, limits, soft_params, workers):
+    """Match RLE-encoded candidates in input order, in parallel when worthwhile."""
+    blobs = list(candidate_blobs)
+    workers = int(workers)
+    if workers <= 1 or len(blobs) < 8:
+        return _match_chunk((query_mask, blobs, mode, limits, soft_params))
+    # A few chunks per worker balance load while pickling the query mask only
+    # once per chunk; RLE blobs are a few KB each instead of full masks.
+    size = max(1, math.ceil(len(blobs) / (workers * 4)))
+    tasks = [(query_mask, blobs[i:i + size], mode, limits, soft_params) for i in range(0, len(blobs), size)]
+    pool = _get_pool(workers)
+    try:
+        chunks = list(pool.map(_match_chunk, tasks))
+    except BrokenProcessPool:
+        LOGGER.warning("rerank worker pool broke; retrying this query in-process")
+        _reset_pool(pool)
+        return _match_chunk((query_mask, blobs, mode, limits, soft_params))
+    return [match for chunk in chunks for match in chunk]
 
 
 def _coarse_cosines(query_fp, matrix, chunk=65536):
@@ -384,13 +442,14 @@ def rank(library: Library, query: QueryObject, mode: str = "soft", semantic_weig
         fp_cos = all_fp_cos
         coarse_time = time.perf_counter() - exact_started
     rerank_start = time.perf_counter()
-    candidate_masks = [library.mask(int(object_id)) for object_id in candidate_ids]
-    matches = _rerank(query.mask, candidate_masks, mode, limits, soft_params, config.workers)
+    candidate_blobs = [library.mask_bytes(int(object_id)) for object_id in candidate_ids]
+    matches = _rerank(query.mask, candidate_blobs, mode, limits, soft_params, config.workers)
     rerank_time = time.perf_counter() - rerank_start
     rows: list[Result] = []
     query_w = query.mask.shape[1]
-    for object_id, match in zip(candidate_ids, matches):
-        row = library.objects.iloc[int(object_id)]
+    # One vectorized row selection instead of a per-candidate iloc lookup.
+    candidate_rows = library.objects.iloc[np.asarray(candidate_ids, dtype=np.int64)].itertuples(index=False)
+    for object_id, match, row in zip(candidate_ids, matches, candidate_rows):
         clip_id, shot_no = str(row.clip_id), int(row.shot_no)
         clip_cos = None
         if query.clip_vector is not None:

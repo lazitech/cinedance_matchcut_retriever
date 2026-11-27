@@ -662,19 +662,25 @@ def hard_prefilter(q_geom: ObjectGeometry, cand: dict[str, np.ndarray], limits) 
 
     frame_w = np.asarray(cand["frame_w"], dtype=float)
     frame_h = np.asarray(cand["frame_h"], dtype=float)
-    cx = np.asarray(cand["cx"], dtype=float)
-    cy = np.asarray(cand["cy"], dtype=float)
     area = np.asarray(cand["area"], dtype=float)
     query_width, query_height = q_geom.frame_w, q_geom.frame_h
     maximum_translation = limits.max_translate_frac * query_width
     maximum_rotation = math.radians(limits.max_rot_deg)
     cover_scale = np.maximum(query_width / frame_w, query_height / frame_h)
+    required_scale = np.sqrt(q_geom.area / (area * cover_scale ** 2))
+    feasible = (required_scale >= limits.min_scale) & (required_scale <= limits.max_scale)
+
+    # The centroid test below is the expensive part on a multi-million-object
+    # library; evaluate it only for candidates that pass the scale test.
+    survivors = np.flatnonzero(feasible)
+    frame_w, frame_h = frame_w[survivors], frame_h[survivors]
+    cover_scale, required_scale = cover_scale[survivors], required_scale[survivors]
+    cx = np.asarray(cand["cx"])[survivors].astype(float)
+    cy = np.asarray(cand["cy"])[survivors].astype(float)
     candidate_points = np.stack([
         cover_scale * cx + (query_width - cover_scale * frame_w) / 2.0,
         cover_scale * cy + (query_height - cover_scale * frame_h) / 2.0,
     ], axis=1)
-    required_scale = np.sqrt(q_geom.area / (area * cover_scale ** 2))
-    feasible = (required_scale >= limits.min_scale) & (required_scale <= limits.max_scale)
 
     # Rotating around the canvas center makes the centroid trace a circular
     # arc. Compute its exact closest distance instead of angular sampling.
@@ -702,7 +708,7 @@ def hard_prefilter(q_geom: ObjectGeometry, cand: dict[str, np.ndarray], limits) 
         on_arc, radial_distance,
         np.minimum(endpoint_distance(-1), endpoint_distance(1)),
     )
-    feasible &= closest_distance <= maximum_translation + 1e-9
+    feasible[survivors] = closest_distance <= maximum_translation + 1e-9
     return feasible
 
 
