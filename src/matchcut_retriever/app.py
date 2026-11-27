@@ -322,6 +322,7 @@ def build_app(engine: QueryEngine | None = None, **engine_kwargs):
             msg = "\n".join(f"⚠️ {w}" for w in warns) if warns else ""
             if t:
                 msg += ("\n" if msg else "") + "Timings: " + ", ".join(f"{key}={value:.3f}s" for key, value in t.items())
+                msg += f" (coarse_method={getattr(results, 'coarse_method', 'exact')})"
             return gallery_items, msg, {"results": [r.to_dict() for r in results]}, results
 
         def on_result(result_list, evt: gr.SelectData = None):

@@ -167,7 +167,11 @@ def summarize_records(records: Iterable[dict[str, Any]], k_values: tuple[int, ..
         }
         exact_hits = sum(h.get("rank") is not None and bool(h.get("exact_object", False)) for h in hits)
         hit_count = sum(h.get("rank") is not None for h in hits)
-        entry: dict[str, Any] = {"n": len(rows), "recall": recall, "recall_at_1": recall.get("1"), "recall_at_10": recall.get("10"), "recall_at_50": recall.get("50"), "exact_object_share": exact_hits / hit_count if hit_count else 0.0, "median_rank_time_s": float(np.median(times)) if times else None}
+        coarse_methods: dict[str, int] = {}
+        for hit in hits:
+            method = str(hit.get("coarse_method", "unknown"))
+            coarse_methods[method] = coarse_methods.get(method, 0) + 1
+        entry: dict[str, Any] = {"n": len(rows), "recall": recall, "recall_at_1": recall.get("1"), "recall_at_10": recall.get("10"), "recall_at_50": recall.get("50"), "exact_object_share": exact_hits / hit_count if hit_count else 0.0, "median_rank_time_s": float(np.median(times)) if times else None, "coarse_methods": coarse_methods}
         entry.update({f"recall@{k}": value for k, value in recall.items()})
         for label, predicate in (("area", lambda r: _bucket(float(r.get("area_frac", 0.0)))), ("segmenter", lambda r: str(r.get("segmenter", "unknown")))):
             groups: dict[str, list[int | None]] = {}
@@ -195,13 +199,14 @@ def summarize_records(records: Iterable[dict[str, Any]], k_values: tuple[int, ..
 
 
 def _markdown(summary: dict[str, Any]) -> str:
-    lines = ["# Match-cut retriever self-test", "", "| Mask source | Mode | n | Recall@1 | Recall@10 | Recall@50 | Exact object | Median rank time (s) |", "|---|---:|---:|---:|---:|---:|---:|---:|"]
+    lines = ["# Match-cut retriever self-test", "", "| Mask source | Mode | Coarse method | n | Recall@1 | Recall@10 | Recall@50 | Exact object | Median rank time (s) |", "|---|---|---:|---:|---:|---:|---:|---:|---:|"]
     for source, modes in summary.get("modes", {}).items():
         for mode, item in modes.items():
             recall = item["recall"]
             fmt = lambda value: "—" if value is None else f"{value:.3f}"
             median = "—" if item["median_rank_time_s"] is None else f"{item['median_rank_time_s']:.2f}"
-            lines.append(f"| {source} | {mode} | {item['n']} | {fmt(recall.get('1'))} | {fmt(recall.get('10'))} | {fmt(recall.get('50'))} | {item['exact_object_share']:.3f} | {median} |")
+            methods = ", ".join(f"{name}:{count}" for name, count in sorted(item.get("coarse_methods", {}).items())) or "—"
+            lines.append(f"| {source} | {mode} | {methods} | {item['n']} | {fmt(recall.get('1'))} | {fmt(recall.get('10'))} | {fmt(recall.get('50'))} | {item['exact_object_share']:.3f} | {median} |")
     for source, modes in summary.get("modes", {}).items():
         for mode, item in modes.items():
             lines += ["", f"### {source} / {mode} breakdown", "", "| Group | n | Recall@1 | Recall@10 | Recall@50 |", "|---|---:|---:|---:|---:|"]
@@ -216,7 +221,7 @@ def _markdown(summary: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def run_selftest(library_root: str | Path, out: str | Path, n: int = 200, seed: int = 0, mask_source: str = "both", modes: Iterable[str] = ("soft", "hard"), k_max: int = 50, semantic: float = 0.0, config_path: str | Path | None = None, retrieval_config: str | Path | None = None, device: str = "cuda:0", workers: int | None = None, coarse_n: int | None = None, hard_coarse_n: int | None = None, shard: str | None = None, point_segmenter: Any = None, embedder: Any = None, render_failures: int = 0) -> dict[str, Any]:
+def run_selftest(library_root: str | Path, out: str | Path, n: int = 200, seed: int = 0, mask_source: str = "both", modes: Iterable[str] = ("soft", "hard"), k_max: int = 50, semantic: float = 0.0, config_path: str | Path | None = None, retrieval_config: str | Path | None = None, device: str = "cuda:0", workers: int | None = None, coarse_n: int | None = None, hard_coarse_n: int | None = None, coarse_method: str | None = None, pca_shortlist_factor: int | None = None, shard: str | None = None, point_segmenter: Any = None, embedder: Any = None, render_failures: int = 0) -> dict[str, Any]:
     """Run or resume the self-test and write summary.json/summary.md."""
     root, out = Path(library_root), Path(out)
     out.mkdir(parents=True, exist_ok=True)
@@ -228,7 +233,7 @@ def run_selftest(library_root: str | Path, out: str | Path, n: int = 200, seed: 
     records_path = out / (f"records-{shard_index:03d}-of-{shard_count:03d}.jsonl" if shard_count > 1 else "records.jsonl")
     existing = {int(r.get("sample_index")) for r in _load_records(out)}
     config = load_retrieval_config(retrieval_config)
-    config = override_config(config, semantic_weight=float(semantic), workers=workers, coarse_n=coarse_n, hard_coarse_n=hard_coarse_n, k=int(k_max))
+    config = override_config(config, semantic_weight=float(semantic), workers=workers, coarse_n=coarse_n, hard_coarse_n=hard_coarse_n, coarse_method=coarse_method, pca_shortlist_factor=pca_shortlist_factor, k=int(k_max))
     modes = [str(m).strip().lower() for m in modes if str(m).strip()]
     if any(mode not in {"soft", "hard"} for mode in modes):
         raise ValueError("modes must contain only soft and hard")
@@ -282,6 +287,7 @@ def run_selftest(library_root: str | Path, out: str | Path, n: int = 200, seed: 
                         hit = _hit_for_source(results, row.clip_id, row.shot_no, object_id)
                         hit["timing_s"] = float(elapsed)
                         hit["rank_timings"] = dict(getattr(results, "timings", {}))
+                        hit["coarse_method"] = str(getattr(results, "coarse_method", "exact"))
                         record["results"][source][mode] = hit
                         if hit["rank"] is None and render_failures:
                             failure_dir = out / "failures" / source / mode
@@ -293,7 +299,7 @@ def run_selftest(library_root: str | Path, out: str | Path, n: int = 200, seed: 
                 for source in sources:
                     record["results"].setdefault(source, {})
                     for mode in modes:
-                        record["results"][source].setdefault(mode, {"rank": None, "exact_object": False, "iou": None, "timing_s": 0.0})
+                        record["results"][source].setdefault(mode, {"rank": None, "exact_object": False, "iou": None, "timing_s": 0.0, "coarse_method": "error"})
             stream.write(json.dumps(record, sort_keys=True) + "\n")
             stream.flush()
     records = _load_records(out)
@@ -309,7 +315,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config"); parser.add_argument("--retrieval-config"); parser.add_argument("--library-root")
     parser.add_argument("--out", required=True); parser.add_argument("--n", type=int, default=200); parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mask-source", choices=("sam", "gt", "both"), default="both"); parser.add_argument("--modes", default="soft,hard"); parser.add_argument("--k-max", type=int, default=50)
-    parser.add_argument("--semantic", type=float, default=0.0); parser.add_argument("--device", default="cuda:0"); parser.add_argument("--workers", type=int); parser.add_argument("--coarse-n", type=int); parser.add_argument("--hard-coarse-n", type=int)
+    parser.add_argument("--semantic", type=float, default=0.0); parser.add_argument("--device", default="cuda:0"); parser.add_argument("--workers", type=int); parser.add_argument("--coarse-n", type=int); parser.add_argument("--hard-coarse-n", type=int); parser.add_argument("--coarse-method", choices=("auto", "exact", "pca")); parser.add_argument("--pca-shortlist-factor", type=int)
     parser.add_argument("--shard"); parser.add_argument("--summarize-only", action="store_true"); parser.add_argument("--render-failures", type=int, default=0)
     return parser
 
@@ -321,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
         summary = summarize_records(_load_records(out)); (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n"); (out / "summary.md").write_text(_markdown(summary)); print((out / "summary.md").read_text(), end=""); return 0
     if not args.library_root:
         args.library_root = str(load_paths(args.config).library_root)
-    run_selftest(args.library_root, out, n=args.n, seed=args.seed, mask_source=args.mask_source, modes=args.modes.split(","), k_max=args.k_max, semantic=args.semantic, config_path=args.config, retrieval_config=args.retrieval_config, device=args.device, workers=args.workers, coarse_n=args.coarse_n, hard_coarse_n=args.hard_coarse_n, shard=args.shard, render_failures=args.render_failures)
+    run_selftest(args.library_root, out, n=args.n, seed=args.seed, mask_source=args.mask_source, modes=args.modes.split(","), k_max=args.k_max, semantic=args.semantic, config_path=args.config, retrieval_config=args.retrieval_config, device=args.device, workers=args.workers, coarse_n=args.coarse_n, hard_coarse_n=args.hard_coarse_n, coarse_method=args.coarse_method, pca_shortlist_factor=args.pca_shortlist_factor, shard=args.shard, render_failures=args.render_failures)
     return 0
 
 

@@ -28,6 +28,18 @@ On a host that cannot reach GitHub, wrap network commands with the temporary pro
 Uses CineDance-1M (gated, CC-BY-NC-SA). No video, frames, masks, annotations or features are
 committed to this repository.
 
+## Building a retrieval library
+
+After object extraction, consolidate the parts and build the PCA shortlist index:
+
+```bash
+.venv/bin/python -m matchcut_retriever.library consolidate --config configs/local.toml
+.venv/bin/python -m matchcut_retriever.library pca --config configs/local.toml
+```
+
+Every `consolidate` creates a new index generation, which makes an older PCA index stale. Re-run
+the `pca` command after consolidating before using PCA coarse search.
+
 ## Gradio UI
 
 Queries load SAM and CLIP, so run the UI on the GPU server with both extras installed

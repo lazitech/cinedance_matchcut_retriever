@@ -645,6 +645,118 @@ def consolidate(root) -> dict[str, Any]:
     }
 
 
+def _pca_status(root: Path, meta: dict[str, Any] | None = None) -> tuple[str, str]:
+    """Return the published PCA index status without raising on stale files."""
+
+    root = Path(root)
+    index = root / "index"
+    metadata_path = index / "shape_pca.json"
+    if not metadata_path.is_file():
+        return "absent", "metadata missing"
+    try:
+        pca_meta = json.loads(metadata_path.read_text())
+        base_meta = meta if meta is not None else json.loads((index / "meta.json").read_text())
+        dim = int(pca_meta["dim"])
+        n_objects = int(base_meta["n_objects"])
+        if int(pca_meta["n_objects"]) != n_objects:
+            return "stale", "n_objects mismatch"
+        if str(pca_meta["generation"]) != str(base_meta["generation"]):
+            return "stale", "generation mismatch"
+        if str(pca_meta["fingerprint_version"]) != FINGERPRINT_VERSION:
+            return "stale", "fingerprint version mismatch"
+        if dim < 1 or dim > FINGERPRINT_DIM:
+            return "stale", "invalid dimension"
+        projections = np.load(index / "shape_pca.npy", mmap_mode="r")
+        basis = np.load(index / "shape_pca_basis.npy", mmap_mode="r")
+        if projections.shape != (n_objects, dim) or basis.shape != (FINGERPRINT_DIM, dim):
+            return "stale", "array shape mismatch"
+        if projections.ndim != 2 or basis.ndim != 2:
+            return "stale", "array rank mismatch"
+    except Exception as exc:
+        return "stale", f"unreadable: {exc}"
+    return "valid", "ok"
+
+
+def build_pca(root, dim: int = 128, sample: int = 200_000, seed: int = 0) -> dict[str, Any]:
+    """Build and atomically publish the uncentered PCA shortlist index."""
+
+    root = Path(root)
+    # Require a complete, current consolidated index before sampling it.
+    verify_library(root)
+    meta = json.loads((root / "index" / "meta.json").read_text())
+    n_objects = int(meta["n_objects"])
+    dim = int(dim)
+    if dim < 1 or dim > FINGERPRINT_DIM:
+        raise ValueError(f"dim must be between 1 and {FINGERPRINT_DIM}")
+    sample = max(1, int(sample))
+    shape_path = root / "index" / "shape_fp.npy"
+    shape_fp = np.load(shape_path, mmap_mode="r")
+    if tuple(shape_fp.shape) != (n_objects, FINGERPRINT_DIM):
+        raise ValueError("shape_fp.npy shape disagrees with index/meta.json")
+    sample_n = min(sample, n_objects)
+    if sample_n:
+        rng = np.random.default_rng(int(seed))
+        indices = rng.choice(n_objects, size=sample_n, replace=False)
+        sampled = np.asarray(shape_fp[indices], dtype=np.float32)
+        second = (sampled.T @ sampled) / float(sample_n)
+        eigenvalues, eigenvectors = np.linalg.eigh(second)
+        order = np.argsort(eigenvalues)[::-1][:dim]
+        basis = np.asarray(eigenvectors[:, order], dtype=np.float32)
+        selected_values = np.maximum(np.asarray(eigenvalues[order], dtype=np.float64), 0.0)
+        total_energy = float(np.maximum(eigenvalues, 0.0).sum())
+        explained = float(np.clip(selected_values.sum() / total_energy, 0.0, 1.0)) if total_energy > 0 else 0.0
+    else:
+        basis = np.zeros((FINGERPRINT_DIM, dim), dtype=np.float32)
+        explained = 0.0
+
+    index_dir = root / "index"
+    index_dir.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
+    projections_tmp = index_dir / f".shape_pca-{token}.npy"
+    basis_tmp = index_dir / f".shape_pca_basis-{token}.npy"
+    metadata_tmp = index_dir / f".shape_pca-{token}.json"
+    projections_mem = None
+    try:
+        projections_mem = np.lib.format.open_memmap(
+            projections_tmp, mode="w+", dtype=np.float16, shape=(n_objects, dim)
+        )
+        chunk = 65_536
+        for start in range(0, n_objects, chunk):
+            stop = min(n_objects, start + chunk)
+            projections_mem[start:stop] = np.asarray(shape_fp[start:stop], dtype=np.float32) @ basis
+        projections_mem.flush()
+        del projections_mem
+        projections_mem = None
+        np.save(basis_tmp, basis)
+        pca_meta = {
+            "dim": dim,
+            "sample": sample,
+            "seed": int(seed),
+            "n_objects": n_objects,
+            "fingerprint_version": FINGERPRINT_VERSION,
+            "generation": meta["generation"],
+            "explained_energy_fraction": explained,
+        }
+        metadata_tmp.write_text(json.dumps(pca_meta, indent=2, sort_keys=True))
+        os.replace(projections_tmp, index_dir / "shape_pca.npy")
+        os.replace(basis_tmp, index_dir / "shape_pca_basis.npy")
+        os.replace(metadata_tmp, index_dir / "shape_pca.json")
+    finally:
+        if projections_mem is not None:
+            projections_mem.flush()
+        for path in (projections_tmp, basis_tmp, metadata_tmp):
+            path.unlink(missing_ok=True)
+    return {
+        "dim": dim,
+        "sample": sample,
+        "seed": int(seed),
+        "n_objects": n_objects,
+        "fingerprint_version": FINGERPRINT_VERSION,
+        "generation": meta["generation"],
+        "explained_energy_fraction": explained,
+    }
+
+
 def _refingerprint_part_worker(part_path: str) -> dict[str, Any]:
     """Recompute one part while keeping all non-fingerprint files untouched."""
 
@@ -789,7 +901,10 @@ def verify_library(root) -> None:
     # report it with the migration hint rather than as an inconsistency.
     if fingerprint_version != FINGERPRINT_VERSION:
         raise _version_error("library index", fingerprint_version)
-    LOG.info("verified library: objects=%d fingerprint_version=%s", n_objects, fingerprint_version)
+    pca_state, pca_reason = _pca_status(root, meta)
+    if pca_state == "stale":
+        LOG.warning("PCA index is stale: %s", pca_reason)
+    LOG.info("verified library: objects=%d fingerprint_version=%s pca_status=%s%s", n_objects, fingerprint_version, pca_state, f" ({pca_reason})" if pca_reason else "")
 
 
 def _outline(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -855,8 +970,10 @@ def _summary(root: Path) -> dict[str, Any]:
     if not objects_path.is_file():
         meta_path = root / "index" / "meta.json"
         meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
+        pca_state, pca_reason = _pca_status(root, meta) if meta else ("absent", "metadata missing")
         return {"objects": 0, "clips": 0, "keyframes": 0, "skipped_keyframes": 0,
-                "fingerprint_version": _fingerprint_version(meta), "bytes": {}}
+                "fingerprint_version": _fingerprint_version(meta), "pca_status": pca_state,
+                "pca_reason": pca_reason, "bytes": {}}
     frame = pd.read_parquet(objects_path)
     keyframes = int(frame["keyframe_id"].nunique()) if len(frame) else 0
     clips = int(frame["clip_id"].nunique()) if len(frame) else 0
@@ -866,9 +983,11 @@ def _summary(root: Path) -> dict[str, Any]:
             bytes_map[str(path.relative_to(root))] = path.stat().st_size
     meta_path = root / "index" / "meta.json"
     meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
+    pca_state, pca_reason = _pca_status(root, meta)
     return {"objects": len(frame), "clips": clips, "keyframes": keyframes, "skipped_keyframes": 0,
             "objects_per_keyframe": (len(frame) / keyframes if keyframes else 0.0),
-            "fingerprint_version": _fingerprint_version(meta), "bytes": bytes_map}
+            "fingerprint_version": _fingerprint_version(meta), "pca_status": pca_state,
+            "pca_reason": pca_reason, "bytes": bytes_map}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -884,6 +1003,11 @@ def main(argv: list[str] | None = None) -> int:
     build.add_argument("--config")
     con = sub.add_parser("consolidate"); con.add_argument("--config")
     ref = sub.add_parser("refingerprint"); ref.add_argument("--config"); ref.add_argument("--workers", type=int, default=1)
+    pca = sub.add_parser("pca")
+    pca.add_argument("--config")
+    pca.add_argument("--dim", type=int, default=128)
+    pca.add_argument("--sample", type=int, default=200_000)
+    pca.add_argument("--seed", type=int, default=0)
     stats = sub.add_parser("stats"); stats.add_argument("--config")
     neigh = sub.add_parser("neighbours"); neigh.add_argument("--n", type=int, default=12); neigh.add_argument("--k", type=int, default=8); neigh.add_argument("--seed", type=int, default=0); neigh.add_argument("--out"); neigh.add_argument("--config")
     args = parser.parse_args(argv)
@@ -896,6 +1020,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.workers < 1:
             raise SystemExit("--workers must be >= 1")
         print(json.dumps(refingerprint(root, args.workers), indent=2, sort_keys=True))
+    elif args.command == "pca":
+        print(json.dumps(build_pca(root, args.dim, args.sample, args.seed), indent=2, sort_keys=True))
     elif args.command == "stats":
         verify_library(root)
         print(json.dumps(_summary(root), indent=2, sort_keys=True))

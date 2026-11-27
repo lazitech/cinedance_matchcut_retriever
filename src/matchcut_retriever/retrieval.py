@@ -35,9 +35,10 @@ LOGGER = logging.getLogger(__name__)
 class RankedResults(list):
     """List of :class:`Result` objects with coarse/rerank timing metadata."""
 
-    def __init__(self, values=(), timings=None):
+    def __init__(self, values=(), timings=None, coarse_method="exact"):
         super().__init__(values)
         self.timings = timings or {}
+        self.coarse_method = coarse_method
 
 
 @dataclass(frozen=True)
@@ -133,7 +134,8 @@ class Result:
 class Library:
     """Memory-mapped retrieval library following the shared card contract."""
 
-    def __init__(self, root: Path, objects: pd.DataFrame, masks_bin, shape_fp, clip_emb, meta, keyframes, shots):
+    def __init__(self, root: Path, objects: pd.DataFrame, masks_bin, shape_fp, clip_emb, meta, keyframes, shots,
+                 shape_pca=None, pca_basis=None, pca_status="absent", pca_status_reason=None):
         self.root = Path(root)
         self.objects = objects.reset_index(drop=True)
         self.masks_bin = masks_bin
@@ -142,6 +144,15 @@ class Library:
         self.meta = meta
         self.keyframes = keyframes
         self.shots = shots
+        self.shape_pca = shape_pca
+        self.pca_basis = pca_basis
+        self.pca_status = pca_status
+        self.pca_status_reason = pca_status_reason
+        self._geometry_cache = {
+            name: self.objects[name].to_numpy(dtype=np.float32, copy=True)
+            for name in ("frame_w", "frame_h", "cx", "cy", "area", "eccentricity", "angle")
+            if name in self.objects
+        }
         self._keyframe_by_id = {str(row.keyframe_id): row for row in keyframes.itertuples(index=False)}
         self._shot_by_id = {(str(row.clip_id), int(row.shot_no)): row for row in shots.itertuples(index=False)}
         # Public aliases make per-shot/keyframe metadata convenient for callers.
@@ -191,7 +202,38 @@ class Library:
         keyframes = pd.read_parquet(root / "keyframes.parquet")
         shots_path = root / "shots.parquet"
         shots = pd.read_parquet(shots_path) if shots_path.is_file() else pd.DataFrame(columns=["clip_id", "shot_no", "start_s", "end_s"])
-        return cls(root, objects, masks_bin, shape_fp, clip_emb, meta, keyframes, shots)
+        shape_pca = basis = None
+        pca_status = "absent"
+        pca_reason = "metadata missing"
+        pca_meta_path = root / "index" / "shape_pca.json"
+        if pca_meta_path.is_file():
+            try:
+                pmeta = json.loads(pca_meta_path.read_text())
+                dim = int(pmeta["dim"])
+                if int(pmeta.get("n_objects")) != n:
+                    raise ValueError("n_objects mismatch")
+                if str(pmeta.get("fingerprint_version")) != FINGERPRINT_VERSION:
+                    raise ValueError("fingerprint_version mismatch")
+                if pmeta.get("generation") != meta.get("generation"):
+                    raise ValueError("generation mismatch")
+                if dim < 1 or dim > shape_fp.shape[1]:
+                    raise ValueError("invalid dim")
+                pca_path = root / "index" / "shape_pca.npy"
+                basis_path = root / "index" / "shape_pca_basis.npy"
+                shape_pca = np.asarray(np.load(pca_path), dtype=np.float32)
+                basis = np.asarray(np.load(basis_path), dtype=np.float32)
+                if shape_pca.shape != (n, dim) or basis.shape != (shape_fp.shape[1], dim):
+                    raise ValueError("array shape mismatch")
+                shape_pca = np.ascontiguousarray(shape_pca)
+                basis = np.ascontiguousarray(basis)
+                pca_status = "valid"
+                pca_reason = "ok"
+            except Exception as exc:
+                pca_status = "stale"
+                pca_reason = str(exc)
+                LOGGER.warning("stale PCA index at %s: %s", root, exc)
+        return cls(root, objects, masks_bin, shape_fp, clip_emb, meta, keyframes, shots,
+                   shape_pca, basis, pca_status, pca_reason)
 
     def mask(self, object_id: int) -> np.ndarray:
         row = self.objects.iloc[int(object_id)]
@@ -199,7 +241,7 @@ class Library:
         return rle_decode(memoryview(self.masks_bin)[start:start + length])
 
     def geometry_arrays(self) -> dict[str, np.ndarray]:
-        return {name: self.objects[name].to_numpy() for name in ("frame_w", "frame_h", "cx", "cy", "area")}
+        return {name: self._geometry_cache[name] for name in ("frame_w", "frame_h", "cx", "cy", "area")}
 
     def keyframe_path(self, keyframe_id: str) -> Path:
         row = self._keyframe_by_id.get(str(keyframe_id))
@@ -235,6 +277,23 @@ def _coarse_cosines(query_fp, matrix, chunk=65536):
     return values
 
 
+def _top_cosine_ids(ids: np.ndarray, scores: np.ndarray, limit: int) -> np.ndarray:
+    """Select top scores with deterministic descending-score/id tie order."""
+    ids = np.asarray(ids, dtype=np.int64)
+    scores = np.asarray(scores, dtype=np.float32)
+    limit = max(0, min(int(limit), len(ids)))
+    if limit == 0:
+        return ids[:0]
+    if limit < len(ids):
+        part = np.argpartition(-scores, limit - 1)[:limit]
+        cutoff = float(np.min(scores[part]))
+        selected = np.flatnonzero(scores >= cutoff)
+    else:
+        selected = np.arange(len(ids))
+    order = np.lexsort((ids[selected], -scores[selected]))
+    return ids[selected[order[:limit]]]
+
+
 def rank(library: Library, query: QueryObject, mode: str = "soft", semantic_weight: float | None = None,
          k: int | None = None, params: RetrievalConfig | HardLimits | SoftParams | None = None) -> RankedResults:
     """Rank library objects by shape, optional semantic similarity, and merge per shot."""
@@ -243,12 +302,20 @@ def rank(library: Library, query: QueryObject, mode: str = "soft", semantic_weig
         raise ValueError("mode must be 'soft' or 'hard'")
     if isinstance(params, dict):
         base = load_retrieval_config()
-        updates = {key: value for key, value in params.items() if key in {"coarse_n", "hard_coarse_n", "workers", "k", "semantic_weight"}}
+        updates = {key: value for key, value in params.items() if key in {"coarse_n", "hard_coarse_n", "workers", "k", "semantic_weight", "coarse_method", "pca_shortlist_factor"}}
         if isinstance(params.get("hard_limits"), dict):
             updates["hard_limits"] = HardLimits(**params["hard_limits"])
         if isinstance(params.get("soft_params"), dict):
             updates["soft_params"] = SoftParams(**params["soft_params"])
+        if "coarse_method" in updates:
+            updates["coarse_method"] = str(updates["coarse_method"]).lower()
+        if "pca_shortlist_factor" in updates:
+            updates["pca_shortlist_factor"] = int(updates["pca_shortlist_factor"])
         config = replace(base, **updates)
+        if config.coarse_method not in {"auto", "exact", "pca"}:
+            raise ValueError("coarse_method must be one of auto, exact, pca")
+        if int(config.pca_shortlist_factor) < 1:
+            raise ValueError("pca_shortlist_factor must be >= 1")
     else:
         config = params if isinstance(params, RetrievalConfig) else load_retrieval_config()
     limits = params if isinstance(params, HardLimits) else config.hard_limits
@@ -258,8 +325,6 @@ def rank(library: Library, query: QueryObject, mode: str = "soft", semantic_weig
         raise ValueError("semantic ranking requires query.clip_vector when semantic_weight is non-zero")
     top_k = int(k if k is not None else config.k)
     started = time.perf_counter()
-    fp_cos = _coarse_cosines(query.fingerprint, library.shape_fp)
-    coarse_time = time.perf_counter() - started
     if mode == "hard":
         pre_start = time.perf_counter()
         feasible = hard_prefilter(query.geometry, library.geometry_arrays(), limits)
@@ -271,8 +336,8 @@ def rank(library: Library, query: QueryObject, mode: str = "soft", semantic_weig
         # only differences beyond max_rot_deg + hard_axis_margin_deg exclude.
         if "angle" in library.objects and "eccentricity" in library.objects:
             q_ecc = float(query.geometry.eccentricity)
-            c_ecc = library.objects.eccentricity.to_numpy(dtype=float)
-            c_angle = library.objects.angle.to_numpy(dtype=float)
+            c_ecc = library._geometry_cache["eccentricity"]
+            c_angle = library._geometry_cache["angle"]
             delta = np.abs((c_angle - float(query.geometry.angle) + math.pi / 2) % math.pi - math.pi / 2)
             axis_threshold = float(config.hard_axis_ecc_threshold)
             feasible &= ~((q_ecc > axis_threshold) & (c_ecc > axis_threshold) & (delta > math.radians(limits.max_rot_deg + config.hard_axis_margin_deg) + 1e-9))
@@ -283,8 +348,38 @@ def rank(library: Library, query: QueryObject, mode: str = "soft", semantic_weig
         survivor_ids = np.arange(len(library.objects), dtype=np.int64)
         prefilter_time = 0.0
         coarse_n = config.coarse_n
-    order = np.argsort(-fp_cos[survivor_ids], kind="stable")[:max(0, int(coarse_n))]
-    candidate_ids = survivor_ids[order]
+    method = str(config.coarse_method).lower()
+    if method not in {"auto", "exact", "pca"}:
+        raise ValueError("coarse_method must be one of auto, exact, pca")
+    if method == "auto":
+        method = "pca" if library.pca_status == "valid" else "exact"
+    if method == "pca" and library.pca_status != "valid":
+        reason = library.pca_status_reason or "PCA index is absent"
+        raise ValueError(f"coarse_method='pca' requires a valid PCA index ({reason})")
+    pca_time = 0.0
+    rescore_time = 0.0
+    if method == "pca":
+        pca_started = time.perf_counter()
+        qproj = np.asarray(query.fingerprint, dtype=np.float32) @ library.pca_basis
+        pca_scores = np.asarray(library.shape_pca @ qproj, dtype=np.float32)
+        shortlist_n = min(len(survivor_ids), int(config.pca_shortlist_factor) * int(coarse_n))
+        shortlist_ids = _top_cosine_ids(survivor_ids, pca_scores[survivor_ids], shortlist_n)
+        pca_time = time.perf_counter() - pca_started
+        rescore_started = time.perf_counter()
+        # Read the memmap in ascending object-id order for locality, then restore score order.
+        exact_ids = np.sort(shortlist_ids)
+        exact_scores = _coarse_cosines(query.fingerprint, library.shape_fp[exact_ids])
+        fp_cos = np.zeros(len(library.objects), dtype=np.float32)
+        fp_cos[exact_ids] = exact_scores
+        candidate_ids = _top_cosine_ids(exact_ids, exact_scores, int(coarse_n))
+        rescore_time = time.perf_counter() - rescore_started
+        coarse_time = pca_time + rescore_time
+    else:
+        exact_started = time.perf_counter()
+        all_fp_cos = _coarse_cosines(query.fingerprint, library.shape_fp)
+        candidate_ids = _top_cosine_ids(survivor_ids, all_fp_cos[survivor_ids], int(coarse_n))
+        fp_cos = all_fp_cos
+        coarse_time = time.perf_counter() - exact_started
     rerank_start = time.perf_counter()
     candidate_masks = [library.mask(int(object_id)) for object_id in candidate_ids]
     matches = _rerank(query.mask, candidate_masks, mode, limits, soft_params, config.workers)
@@ -322,9 +417,9 @@ def rank(library: Library, query: QueryObject, mode: str = "soft", semantic_weig
         if key not in merged:
             merged[key] = item
     results = sorted(merged.values(), key=lambda item: (-item.final_score, -item.geometric_score, item.object_id))[:top_k]
-    timings = {"coarse_search_s": coarse_time, "prefilter_s": prefilter_time, "rerank_s": rerank_time, "total_s": time.perf_counter() - started}
+    timings = {"coarse_search_s": float(coarse_time), "prefilter_s": float(prefilter_time), "rerank_s": float(rerank_time), "pca_s": float(pca_time), "rescore_s": float(rescore_time), "total_s": float(time.perf_counter() - started)}
     LOGGER.info("retrieval timings: %s", timings)
-    return RankedResults(results, timings)
+    return RankedResults(results, timings, method)
 
 
 __all__ = ["Library", "QueryObject", "Result", "RankedResults", "rank"]
