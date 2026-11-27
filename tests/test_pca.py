@@ -214,9 +214,27 @@ def test_failed_pca_rebuild_keeps_previous_index_consistent(tmp_path, monkeypatc
     meta = json.loads(before_meta)
     assert sorted(p.name for p in index.glob("shape_pca*")) == sorted(
         ["shape_pca.json", meta["projections_file"], meta["basis_file"]])
-    assert not list(index.glob(".shape_pca*"))
+    assert [p.name for p in index.glob(".shape_pca*")] == [".shape_pca.lock"]
 
 
 def test_pca_metadata_rejects_path_like_file_names(tmp_path):
     with pytest.raises(ValueError):
         pca_files(tmp_path, {"projections_file": "../x.npy", "basis_file": "b.npy"})
+
+
+def test_concurrent_pca_build_fails_fast_and_keeps_index(tmp_path):
+    import fcntl
+
+    root = _built_root(tmp_path)
+    _build_pca(root, dim=4)
+    index = root / "index"
+    before = (index / "shape_pca.json").read_text()
+    with open(index / ".shape_pca.lock", "a+") as held:
+        fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+        with pytest.raises(RuntimeError, match="another PCA build"):
+            _build_pca(root, dim=6)
+    assert (index / "shape_pca.json").read_text() == before
+    assert Library.load(root).pca_status == "valid"
+    # The lock is released after a normal build, so a later build succeeds.
+    _build_pca(root, dim=6)
+    assert Library.load(root).shape_pca.shape[1] == 6

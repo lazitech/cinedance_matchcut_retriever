@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 from concurrent.futures import ProcessPoolExecutor
 import json
 import logging
@@ -697,9 +698,28 @@ def _pca_status(root: Path, meta: dict[str, Any] | None = None) -> tuple[str, st
 
 
 def build_pca(root, dim: int = 128, sample: int = 200_000, seed: int = 0) -> dict[str, Any]:
-    """Build and atomically publish the uncentered PCA shortlist index."""
+    """Build and atomically publish the uncentered PCA shortlist index.
+
+    Builds are serialized with an exclusive lock on ``index/.shape_pca.lock``: the post-publish
+    cleanup removes other builds' arrays, which is only safe when no other build is running.
+    A second concurrent build fails fast instead of waiting.
+    """
 
     root = Path(root)
+    index_dir = root / "index"
+    index_dir.mkdir(parents=True, exist_ok=True)
+    with open(index_dir / ".shape_pca.lock", "a+") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise RuntimeError(f"another PCA build is running for {root}") from exc
+        try:
+            return _build_pca_locked(root, dim, sample, seed)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _build_pca_locked(root: Path, dim: int, sample: int, seed: int) -> dict[str, Any]:
     # Require a complete, current consolidated index before sampling it.
     verify_library(root)
     meta = json.loads((root / "index" / "meta.json").read_text())
