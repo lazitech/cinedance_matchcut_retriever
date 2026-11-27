@@ -383,6 +383,12 @@ def main(argv=None):
     parser.add_argument("--preload", action="store_true", help="load shape fingerprints and masks into RAM")
     parser.add_argument("--no-warmup", action="store_true", help="load SAM/CLIP lazily on the first request instead of at startup")
     args = parser.parse_args(argv)
+    # `kill -USR1 <pid>` dumps every thread's stack to stderr (ptrace/py-spy is
+    # unavailable on the shared server) for diagnosing a hung request.
+    import faulthandler
+    import signal
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
     app = build_app(library_root=args.library_root, config=args.config, retrieval_config=args.retrieval_config, device=args.device, preload=args.preload)
     if not args.no_warmup:
         app.matchcut_engine.warm_up()
