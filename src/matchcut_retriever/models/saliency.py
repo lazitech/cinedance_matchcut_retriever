@@ -27,8 +27,9 @@ class SaliencyModel:
         self.model = AutoModelForImageSegmentation.from_pretrained(self.model_id, trust_remote_code=True, revision=self.revision, cache_dir=cache_dir).float().eval()
         if self.device.startswith("cuda"):
             self.model = self.model.to(self.device).half()
-        self._normalize, self._to_tensor = transforms
-        self._norm = self._normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        normalize, to_tensor = transforms
+        self._norm = normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        self._to_tensor = to_tensor()
 
     def predict(self, images: list[np.ndarray]) -> list[np.ndarray]:
         from PIL import Image
