@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import builtins
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -137,3 +139,101 @@ def test_projected_image_features_handles_tensor_and_output_objects():
     assert _projected_image_features(SimpleNamespace(image_embeds=embeds, pooler_output=pooled), fake_torch) is embeds
     with pytest.raises(RuntimeError):
         _projected_image_features(SimpleNamespace(), fake_torch)
+
+
+def test_saliency_model_predict_instantiates_transforms_and_batches(monkeypatch):
+    import matchcut_retriever.models.saliency as saliency
+
+    class FakeBatch:
+        def __init__(self, value):
+            self.value = value
+
+        def to(self, device):
+            return self
+
+        def float(self):
+            return self
+
+    class FakePred:
+        def __init__(self, value):
+            self.value = value
+
+        def sigmoid(self):
+            return self
+
+        def __getitem__(self, key):
+            return FakePred(self.value[key])
+
+        def detach(self):
+            return self
+
+        def float(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self.value
+
+    class FakeTorch:
+        @staticmethod
+        def stack(values):
+            return FakeBatch(np.stack(values))
+
+        @staticmethod
+        @contextmanager
+        def inference_mode():
+            yield
+
+    class FakeModel:
+        def __init__(self):
+            self.calls = []
+
+        def float(self):
+            return self
+
+        def eval(self):
+            return self
+
+        def __call__(self, batch):
+            self.calls.append(batch.value.shape[0])
+            # The wrapper expects (B, 1, S, S) before selecting channel 0.
+            return [FakePred(np.full((batch.value.shape[0], 1, 8, 8), 0.5, np.float32))]
+
+    fake_model = FakeModel()
+
+    class FakeAutoModel:
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return fake_model
+
+    class FakeNormalize:
+        def __init__(self, mean, std):
+            self.mean, self.std = mean, std
+
+        def __call__(self, tensor):
+            return tensor
+
+    class FakeToTensor:
+        def __init__(self):
+            pass
+
+        def __call__(self, image):
+            return np.asarray(image, dtype=np.float32).transpose(2, 0, 1)
+
+    monkeypatch.setattr(
+        saliency,
+        "_require_gpu",
+        lambda: (FakeTorch, FakeAutoModel, (FakeNormalize, FakeToTensor)),
+    )
+    model = saliency.SaliencyModel(device="cpu", input_size=8, batch_size=2)
+    images = [
+        np.zeros((3, 5, 3), dtype=np.uint8),
+        np.zeros((7, 2, 3), dtype=np.uint8),
+        np.zeros((4, 9, 3), dtype=np.uint8),
+    ]
+    outputs = model.predict(images)
+    assert [output.shape for output in outputs] == [(3, 5), (7, 2), (4, 9)]
+    assert all(output.dtype == np.float32 and np.all((output >= 0) & (output <= 1)) for output in outputs)
+    assert fake_model.calls == [2, 1]

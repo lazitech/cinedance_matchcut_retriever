@@ -104,6 +104,7 @@ def build_parser():
     parser.add_argument("--mask")
     parser.add_argument("--mode", choices=("hard", "soft"), default="soft")
     parser.add_argument("--semantic", type=float, default=None)
+    parser.add_argument("--min-subject", type=float, default=None, help="minimum library subject saliency score (0 disables)")
     parser.add_argument("--k", type=int, default=None)
     parser.add_argument("--min-scale", type=float)
     parser.add_argument("--max-scale", type=float)
@@ -162,7 +163,7 @@ def main(argv=None):
     if not args.no_clip:
         from .models import ClipEmbedder
         clip_vector = ClipEmbedder(device=args.device, cache_dir=(paths.hf_cache if paths else None)).embed_masked([prepared], [mask])[0]
-    config = override_config(config, min_scale=args.min_scale, max_scale=args.max_scale, max_translate_frac=args.max_translate, max_rot_deg=args.max_rot, coarse_n=args.coarse_n, hard_coarse_n=args.hard_coarse_n, coarse_method=args.coarse_method, pca_shortlist_factor=args.pca_shortlist_factor, workers=args.workers, k=args.k, semantic_weight=semantic)
+    config = override_config(config, min_scale=args.min_scale, max_scale=args.max_scale, max_translate_frac=args.max_translate, max_rot_deg=args.max_rot, coarse_n=args.coarse_n, hard_coarse_n=args.hard_coarse_n, coarse_method=args.coarse_method, pca_shortlist_factor=args.pca_shortlist_factor, workers=args.workers, k=args.k, semantic_weight=semantic, min_subject_score=args.min_subject)
     if args.library_root:
         library_root = Path(args.library_root)
     else:
@@ -178,8 +179,8 @@ def main(argv=None):
     payload = {
         "query": {"image": str(args.image), "prepared": bool(args.prepared), "x": float(x), "y": float(y), "mask_index": args.mask_index, "height": int(prepared.shape[0]), "width": int(prepared.shape[1]), "area_frac": float(mask.mean()), "candidates": candidates},
         "warnings": warnings,
-        "parameters": {"mode": args.mode, "semantic_weight": semantic, "k": config.k, "coarse_n": config.coarse_n, "hard_coarse_n": config.hard_coarse_n, "coarse_method": config.coarse_method, "pca_shortlist_factor": config.pca_shortlist_factor, "workers": config.workers, "hard_axis_ecc_threshold": config.hard_axis_ecc_threshold, "hard_axis_margin_deg": config.hard_axis_margin_deg,"hard_limits": config.hard_limits.__dict__, "soft_params": config.soft_params.__dict__},
-        "coarse_method": results.coarse_method,
+        "parameters": {"mode": args.mode, "semantic_weight": semantic, "min_subject_score": config.min_subject_score, "k": config.k, "coarse_n": config.coarse_n, "hard_coarse_n": config.hard_coarse_n, "coarse_method": config.coarse_method, "pca_shortlist_factor": config.pca_shortlist_factor, "workers": config.workers, "hard_axis_ecc_threshold": config.hard_axis_ecc_threshold, "hard_axis_margin_deg": config.hard_axis_margin_deg,"hard_limits": config.hard_limits.__dict__, "soft_params": config.soft_params.__dict__},
+        "coarse_method": results.coarse_method, "subject_filter": results.subject_filter,
         "timings": results.timings,
         "results": [item.to_dict() for item in results],
     }

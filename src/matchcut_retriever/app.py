@@ -163,7 +163,8 @@ class QueryEngine:
             return value
 
     def search(self, prepared, mask, mode=None, semantic=None, k=None,
-               min_scale=None, max_scale=None, max_translate=None, max_rot=None):
+               min_scale=None, max_scale=None, max_translate=None, max_rot=None,
+               min_subject=None):
         image = self._array(prepared)
         mask = np.asarray(mask, dtype=bool)
         mode = (mode or "soft").lower()
@@ -171,7 +172,8 @@ class QueryEngine:
         clip_vector = self._clip_vector(image, mask) if weight != 0 else None
         params = override_config(self.config, min_scale=min_scale, max_scale=max_scale,
                                  max_translate_frac=max_translate, max_rot_deg=max_rot,
-                                 k=k, semantic_weight=weight)
+                                 k=k, semantic_weight=weight,
+                                 min_subject_score=min_subject)
         query = QueryObject.from_mask(image, mask, clip_vector)
         with self._lock:
             results = rank(self.library, query, mode, semantic_weight=weight,
@@ -224,6 +226,8 @@ def _result_gallery_item(engine, prepared, query_mask, result, rank: int):
     if result.start_s is not None and result.end_s is not None:
         caption += f" [{result.start_s:.2f}-{result.end_s:.2f}s]"
     caption += f" score={result.final_score:.3f} IoU={result.iou:.3f} cost={result.transform_cost:.3f}"
+    if getattr(result, "subject_score", None) is not None:
+        caption += f" subject={result.subject_score:.3f}"
     if result.clip_cosine is not None:
         caption += f" CLIP={result.clip_cosine:.3f}"
     return panel, caption
@@ -266,6 +270,7 @@ def build_app(engine: QueryEngine | None = None, **engine_kwargs):
         with gr.Row():
             mode = gr.Radio(["soft", "hard"], value="soft", label="Mode")
             semantic = gr.Slider(-1, 1, value=float(cfg.semantic_weight), step=0.05, label="Semantic preference (prefer different class ← ignore → prefer same class)")
+            min_subject = gr.Slider(0, 1, value=float(getattr(cfg, "min_subject_score", 0.5)), step=0.05, label="Minimum subject score")
             k = gr.Slider(5, 50, value=min(20, max(5, cfg.k)), step=1, label="K")
         with gr.Accordion("Hard-mode limits", open=False):
             with gr.Row():
@@ -305,14 +310,17 @@ def build_app(engine: QueryEngine | None = None, **engine_kwargs):
             from .render import _outline
             return _outline(st["prepared"], item["mask"], (255, 70, 40)), st
 
-        def do_search(choice, st, mode_value, semantic_value, k_value, min_s, max_s, trans, rot):
+        def do_search(choice, st, mode_value, semantic_value, min_subject_value, k_value, min_s, max_s, trans, rot):
             if not st or st.get("prepared") is None or not choice:
                 return [], "Click the query image first.", {}, None
             idx = int(str(choice).split(":", 1)[0]); item = st["items"][idx]
-            results, t, warns = engine.search(st["prepared"], item["mask"], mode_value, semantic_value, int(k_value), min_s, max_s, trans, rot)
+            results, t, warns = engine.search(st["prepared"], item["mask"], mode_value, semantic_value, int(k_value), min_s, max_s, trans, rot, min_subject_value)
             gallery_items = [_result_gallery_item(engine, st["prepared"], item["mask"], r, rank)
                              for rank, r in enumerate(results, 1)]
             msg = "\n".join(f"⚠️ {w}" for w in warns) if warns else ""
+            subject_filter = getattr(results, "subject_filter", None)
+            if isinstance(subject_filter, str) and subject_filter.startswith("unavailable"):
+                msg += ("\n" if msg else "") + f"⚠️ Subject filter unavailable: {subject_filter}"
             if t:
                 msg += ("\n" if msg else "") + "Timings: " + ", ".join(f"{key}={value:.3f}s" for key, value in t.items())
                 msg += f" (coarse_method={getattr(results, 'coarse_method', 'exact')})"
@@ -349,7 +357,7 @@ def build_app(engine: QueryEngine | None = None, **engine_kwargs):
         # pixel index before the longer SAM call is queued.
         image.select(on_select, [image], [prepared_view, candidates, warnings, state], queue=False)
         candidates.change(on_candidate, [candidates, state], [prepared_view, state])
-        search_btn.click(do_search, [candidates, state, mode, semantic, k, min_scale, max_scale, max_translate, max_rot], [gallery, timings, breakdown, result_state])
+        search_btn.click(do_search, [candidates, state, mode, semantic, min_subject, k, min_scale, max_scale, max_translate, max_rot], [gallery, timings, breakdown, result_state])
         gallery.select(on_result, [result_state], [breakdown, video])
     # Gradio only serves files from cwd/temp unless the directory is allowed at launch.
     app.matchcut_allowed_paths = [str(engine.video_cache_dir)]

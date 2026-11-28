@@ -42,10 +42,11 @@ LOGGER = logging.getLogger(__name__)
 class RankedResults(list):
     """List of :class:`Result` objects with coarse/rerank timing metadata."""
 
-    def __init__(self, values=(), timings=None, coarse_method="exact"):
+    def __init__(self, values=(), timings=None, coarse_method="exact", subject_filter="off"):
         super().__init__(values)
         self.timings = timings or {}
         self.coarse_method = coarse_method
+        self.subject_filter = subject_filter
 
 
 @dataclass(frozen=True)
@@ -98,6 +99,7 @@ class Result:
     transform_ty_frac: float
     within_limits: bool
     mode: str
+    subject_score: float | None = None
 
     @property
     def scale(self) -> float:
@@ -142,7 +144,8 @@ class Library:
     """Memory-mapped retrieval library following the shared card contract."""
 
     def __init__(self, root: Path, objects: pd.DataFrame, masks_bin, shape_fp, clip_emb, meta, keyframes, shots,
-                 shape_pca=None, pca_basis=None, pca_status="absent", pca_status_reason=None):
+                 shape_pca=None, pca_basis=None, pca_status="absent", pca_status_reason=None,
+                 subject_score=None, subject_status="absent", subject_status_reason=None):
         self.root = Path(root)
         self.objects = objects.reset_index(drop=True)
         self.masks_bin = masks_bin
@@ -155,6 +158,9 @@ class Library:
         self.pca_basis = pca_basis
         self.pca_status = pca_status
         self.pca_status_reason = pca_status_reason
+        self.subject_score = subject_score
+        self.subject_status = subject_status
+        self.subject_status_reason = subject_status_reason
         self._geometry_cache = {
             name: self.objects[name].to_numpy(copy=True)
             for name in ("frame_w", "frame_h", "cx", "cy", "area", "eccentricity", "angle")
@@ -241,8 +247,35 @@ class Library:
         elif pca_state == "stale":
             pca_status, pca_reason = "stale", pca_reason
             LOGGER.warning("stale PCA index at %s: %s", root, pca_reason)
+        subject_score = None
+        subject_status, subject_reason = "absent", "subject index metadata missing"
+        subject_meta_path = root / "index" / "subject.json"
+        subject_data_path = root / "index" / "subject.npy"
+        if subject_meta_path.is_file() != subject_data_path.is_file():
+            subject_status, subject_reason = "stale", "subject index data and metadata are incomplete"
+            LOGGER.warning("subject index unavailable at %s: %s", root, subject_reason)
+        elif subject_meta_path.is_file() and subject_data_path.is_file():
+            try:
+                smeta = json.loads(subject_meta_path.read_text())
+                if not smeta.get("generation") or not meta.get("generation"):
+                    subject_status, subject_reason = "stale", "generation metadata is missing"
+                elif smeta.get("generation") != meta.get("generation"):
+                    subject_status, subject_reason = "stale", "generation differs from index/meta.json"
+                elif int(smeta.get("n_objects", -1)) != n:
+                    subject_status, subject_reason = "stale", "n_objects does not match objects.parquet"
+                else:
+                    arr = np.load(subject_data_path, mmap_mode="r")
+                    if arr.ndim != 1 or len(arr) != n:
+                        subject_status, subject_reason = "stale", "subject.npy length does not match objects.parquet"
+                    else:
+                        subject_score = np.asarray(arr, dtype=np.float32) if preload else arr.astype(np.float32, copy=False)
+                        subject_status, subject_reason = "valid", "ok"
+            except Exception as exc:
+                subject_status, subject_reason = "stale", str(exc)
+            if subject_status != "valid":
+                LOGGER.warning("subject index unavailable at %s: %s", root, subject_reason)
         return cls(root, objects, masks_bin, shape_fp, clip_emb, meta, keyframes, shots,
-                   shape_pca, basis, pca_status, pca_reason)
+                   shape_pca, basis, pca_status, pca_reason, subject_score, subject_status, subject_reason)
 
     def mask_bytes(self, object_id: int) -> bytes:
         """Return the object's RLE-encoded mask (decode with ``rle_decode``)."""
@@ -378,7 +411,7 @@ def rank(library: Library, query: QueryObject, mode: str = "soft", semantic_weig
         raise ValueError("mode must be 'soft' or 'hard'")
     if isinstance(params, dict):
         base = load_retrieval_config()
-        updates = {key: value for key, value in params.items() if key in {"coarse_n", "hard_coarse_n", "workers", "k", "semantic_weight", "coarse_method", "pca_shortlist_factor"}}
+        updates = {key: value for key, value in params.items() if key in {"coarse_n", "hard_coarse_n", "workers", "k", "semantic_weight", "coarse_method", "pca_shortlist_factor", "min_subject_score"}}
         if isinstance(params.get("hard_limits"), dict):
             updates["hard_limits"] = HardLimits(**params["hard_limits"])
         if isinstance(params.get("soft_params"), dict):
@@ -401,6 +434,14 @@ def rank(library: Library, query: QueryObject, mode: str = "soft", semantic_weig
         raise ValueError("semantic ranking requires query.clip_vector when semantic_weight is non-zero")
     top_k = int(k if k is not None else config.k)
     started = time.perf_counter()
+    subject_threshold = float(config.min_subject_score)
+    subject_filter = "off"
+    if subject_threshold > 0:
+        if library.subject_status == "valid" and library.subject_score is not None:
+            subject_filter = "applied"
+        else:
+            subject_filter = f"unavailable: {library.subject_status_reason or library.subject_status}"
+            LOGGER.warning("subject filter unavailable; proceeding without filtering: %s", subject_filter)
     if mode == "hard":
         pre_start = time.perf_counter()
         feasible = hard_prefilter(query.geometry, library.geometry_arrays(), limits)
@@ -424,6 +465,8 @@ def rank(library: Library, query: QueryObject, mode: str = "soft", semantic_weig
         survivor_ids = np.arange(len(library.objects), dtype=np.int64)
         prefilter_time = 0.0
         coarse_n = config.coarse_n
+    if subject_filter == "applied":
+        survivor_ids = survivor_ids[np.asarray(library.subject_score[survivor_ids]) >= subject_threshold]
     method = str(config.coarse_method).lower()
     if method not in {"auto", "exact", "pca"}:
         raise ValueError("coarse_method must be one of auto, exact, pca")
@@ -487,6 +530,7 @@ def rank(library: Library, query: QueryObject, mode: str = "soft", semantic_weig
             transform_angle_deg=float(np.degrees(transform.angle)), transform_tx_px=float(transform.tx),
             transform_ty_px=float(transform.ty), transform_tx_frac=float(transform.tx / query_w),
             transform_ty_frac=float(transform.ty / query_w), within_limits=bool(match.within_limits), mode=mode,
+            subject_score=(float(library.subject_score[int(object_id)]) if library.subject_score is not None else None),
         ))
     rows.sort(key=lambda item: (-item.final_score, -item.geometric_score, item.object_id))
     merged: dict[tuple[str, int], Result] = {}
@@ -497,7 +541,7 @@ def rank(library: Library, query: QueryObject, mode: str = "soft", semantic_weig
     results = sorted(merged.values(), key=lambda item: (-item.final_score, -item.geometric_score, item.object_id))[:top_k]
     timings = {"coarse_search_s": float(coarse_time), "prefilter_s": float(prefilter_time), "rerank_s": float(rerank_time), "pca_s": float(pca_time), "rescore_s": float(rescore_time), "total_s": float(time.perf_counter() - started)}
     LOGGER.info("retrieval timings: %s", timings)
-    return RankedResults(results, timings, method)
+    return RankedResults(results, timings, method, subject_filter)
 
 
 __all__ = ["Library", "QueryObject", "Result", "RankedResults", "rank"]

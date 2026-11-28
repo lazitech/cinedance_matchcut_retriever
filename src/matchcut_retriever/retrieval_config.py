@@ -24,6 +24,7 @@ class RetrievalConfig:
     hard_axis_margin_deg: float = 10.0
     coarse_method: str = "auto"
     pca_shortlist_factor: int = 20
+    min_subject_score: float = 0.5
 
     def __post_init__(self):
         method = str(self.coarse_method).lower()
@@ -33,6 +34,7 @@ class RetrievalConfig:
             raise ValueError("pca_shortlist_factor must be >= 1")
         object.__setattr__(self, "coarse_method", method)
         object.__setattr__(self, "pca_shortlist_factor", int(self.pca_shortlist_factor))
+        object.__setattr__(self, "min_subject_score", float(self.min_subject_score))
 
     @property
     def min_scale(self): return self.hard_limits.min_scale
@@ -77,6 +79,7 @@ def load_retrieval_config(path: str | Path | None = None) -> RetrievalConfig:
         hard_axis_margin_deg=max(0.0, float(values.get("hard_axis_margin_deg", 10.0))),
         coarse_method=method,
         pca_shortlist_factor=factor,
+        min_subject_score=float(values.get("min_subject_score", 0.5)),
     )
 
 
@@ -90,7 +93,7 @@ def override_config(config: RetrievalConfig, **kwargs) -> RetrievalConfig:
         hard = replace(hard, **hard_updates)
     if soft_updates:
         soft = replace(soft, **soft_updates)
-    updates = {name: kwargs[name] for name in ("coarse_n", "hard_coarse_n", "workers", "k", "semantic_weight", "hard_axis_ecc_threshold", "hard_axis_margin_deg", "coarse_method", "pca_shortlist_factor") if kwargs.get(name) is not None}
+    updates = {name: kwargs[name] for name in ("coarse_n", "hard_coarse_n", "workers", "k", "semantic_weight", "hard_axis_ecc_threshold", "hard_axis_margin_deg", "coarse_method", "pca_shortlist_factor", "min_subject_score") if kwargs.get(name) is not None}
     if "coarse_method" in updates:
         updates["coarse_method"] = str(updates["coarse_method"]).lower()
         if updates["coarse_method"] not in {"auto", "exact", "pca"}:
