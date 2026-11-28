@@ -25,6 +25,7 @@ from .masks import rle_decode, rle_encode
 from .parquet_io import ROW_GROUP_ROWS, read_parquet_buffered
 from .models import Detection, ClipEmbedder, PanopticSegmenter, SamAutoSegmenter, SaliencyModel
 from .models.common import filter_detections
+from .retrieval_config import load_retrieval_config
 from .shape import (
     FINGERPRINT_DIM,
     FINGERPRINT_VERSION,
@@ -1006,7 +1007,10 @@ def build_subject_scores(root, model=None, *, device="cuda", batch_size=8, cache
     keyframes = pd.read_parquet(keyframes_path) if keyframes_path.is_file() else pd.DataFrame()
     path_by_key = {str(r.keyframe_id): str(r.path) for r in keyframes.itertuples(index=False)} if len(keyframes) else {}
     parts = root / "parts"
-    done = 0; objects_done = 0
+    done = 0
+    objects_done = 0
+    keyframes_done = 0
+    started = time.monotonic()
     for cid in clips:
         part_dir = parts / cid
         objects_path = part_dir / "objects.parquet"
@@ -1037,7 +1041,8 @@ def build_subject_scores(root, model=None, *, device="cuda", batch_size=8, cache
             lengths = rows["mask_nbytes"].to_numpy(dtype=np.int64) if len(rows) else np.empty(0, dtype=np.int64)
             scores = np.empty(len(rows), dtype=np.float32)
             offsets = np.zeros(len(rows), dtype=np.int64)
-            if len(rows) > 1: offsets[1:] = np.cumsum(lengths[:-1], dtype=np.int64)
+            if len(rows) > 1:
+                offsets[1:] = np.cumsum(lengths[:-1], dtype=np.int64)
             for j, row in enumerate(rows.itertuples(index=False)):
                 mask = rle_decode(blob[int(offsets[j]):int(offsets[j] + lengths[j])])
                 sal = np.asarray(map_by_key[str(row.keyframe_id)], dtype=np.float32)
@@ -1055,11 +1060,24 @@ def build_subject_scores(root, model=None, *, device="cuda", batch_size=8, cache
             np.save(temp / "subject.npy", scores.astype(np.float16))
             for name in ("saliency.npz", "saliency.json", "subject.npy"):
                 os.replace(temp / name, part_dir / name)
-            done += 1; objects_done += len(rows)
-            LOG.info("saliency clips %d/%d: %s objects=%d", done, len(clips), cid, len(rows))
-        except Exception:
-            shutil.rmtree(temp, ignore_errors=True)
-            raise
+            done += 1
+            objects_done += len(rows)
+            keyframes_done += len(key_ids)
+            elapsed = max(time.monotonic() - started, 1e-9)
+            clips_per_second = done / elapsed
+            keyframes_per_second = keyframes_done / elapsed
+            remaining = max(0, len(clips) - done)
+            eta = remaining / clips_per_second if clips_per_second else None
+            LOG.info(
+                "saliency clips %d/%d (%.2f clips/s, %.2f keyframes/s, ETA %s): %s objects=%d",
+                done,
+                len(clips),
+                clips_per_second,
+                keyframes_per_second,
+                "unknown" if eta is None else f"{eta:.1f}s",
+                cid,
+                len(rows),
+            )
         finally:
             shutil.rmtree(temp, ignore_errors=True)
     return {"clips": done, "objects": objects_done}
@@ -1067,27 +1085,51 @@ def build_subject_scores(root, model=None, *, device="cuda", batch_size=8, cache
 
 def build_subject_index(root) -> dict[str, Any]:
     """Concatenate per-part subject scores in consolidated object order."""
-    root = Path(root); index = root / "index"
+    root = Path(root)
+    index = root / "index"
     meta = json.loads((index / "meta.json").read_text())
-    missing: list[str] = []; arrays: list[np.ndarray] = []; model_info = {}
+    missing: list[str] = []
+    arrays: list[np.ndarray] = []
+    model_info = {}
     for cid in meta.get("clips", []):
-        part = root / "parts" / str(cid); op = part / "objects.parquet"; sp = part / "subject.npy"
+        part = root / "parts" / str(cid)
+        op = part / "objects.parquet"
+        sp = part / "subject.npy"
         if not op.is_file():
             missing.append(str(cid))
             continue
         n = len(pd.read_parquet(op, columns=["mask_nbytes"]))
-        if not sp.is_file(): missing.append(str(cid)); continue
+        if not sp.is_file():
+            missing.append(str(cid))
+            continue
         values = np.asarray(np.load(sp), dtype=np.float16)
-        if len(values) != n: raise ValueError(f"part {cid} subject.npy length {len(values)} disagrees with row count {n}")
+        if len(values) != n:
+            raise ValueError(
+                f"part {cid} subject.npy length {len(values)} disagrees with row count {n}"
+            )
         arrays.append(values)
         side = part / "saliency.json"
-        if side.is_file() and not model_info: model_info = json.loads(side.read_text())
-    if missing: raise ValueError(f"{len(missing)} parts lack subject.npy: {', '.join(missing[:20])}")
+        if side.is_file() and not model_info:
+            model_info = json.loads(side.read_text())
+    if missing:
+        raise ValueError(f"{len(missing)} parts lack subject.npy: {', '.join(missing[:20])}")
     values = np.concatenate(arrays) if arrays else np.empty(0, dtype=np.float16)
-    if len(values) != int(meta["n_objects"]): raise ValueError("subject index length disagrees with n_objects")
-    tmp = index / ".subject.tmp"; np.save(tmp, values); os.replace(index / ".subject.tmp.npy", index / "subject.npy")
-    info = {"generation": meta["generation"], "n_objects": len(values), "model_id": model_info.get("model_id", ""), "revision": model_info.get("revision", ""), "version": model_info.get("version", "s1"), "at_or_above_0.5": int(np.count_nonzero(values >= 0.5))}
-    jtmp = index / ".subject.json.tmp"; jtmp.write_text(json.dumps(info, indent=2, sort_keys=True)); os.replace(jtmp, index / "subject.json")
+    if len(values) != int(meta["n_objects"]):
+        raise ValueError("subject index length disagrees with n_objects")
+    tmp = index / ".subject.tmp"
+    np.save(tmp, values)
+    os.replace(index / ".subject.tmp.npy", index / "subject.npy")
+    info = {
+        "generation": meta["generation"],
+        "n_objects": len(values),
+        "model_id": model_info.get("model_id", ""),
+        "revision": model_info.get("revision", ""),
+        "version": model_info.get("version", "s1"),
+        "at_or_above_0.5": int(np.count_nonzero(values >= 0.5)),
+    }
+    jtmp = index / ".subject.json.tmp"
+    jtmp.write_text(json.dumps(info, indent=2, sort_keys=True))
+    os.replace(jtmp, index / "subject.json")
     return info
 
 
@@ -1178,18 +1220,73 @@ def _subject_summary(root: Path, meta: dict[str, Any]) -> dict[str, Any]:
     path = root / "index" / "subject.json"
     data_path = root / "index" / "subject.npy"
     expected = int(meta.get("n_objects", 0))
+    threshold = load_retrieval_config().min_subject_score
     if path.is_file() != data_path.is_file():
-        return {"subject_status": "stale", "subject_reason": "subject index data and metadata are incomplete", "subject_coverage": 0, "subject_coverage_fraction": 0.0}
-    if not path.is_file(): return {"subject_status": "absent", "subject_reason": "metadata missing", "subject_coverage": 0, "subject_coverage_fraction": 0.0}
+        return {
+            "subject_status": "stale",
+            "subject_reason": "subject index data and metadata are incomplete",
+            "subject_coverage": 0,
+            "subject_coverage_fraction": 0.0,
+            "subject_threshold": threshold,
+            "subject_fraction_at_or_above_threshold": 0.0,
+        }
+    if not path.is_file():
+        return {
+            "subject_status": "absent",
+            "subject_reason": "metadata missing",
+            "subject_coverage": 0,
+            "subject_coverage_fraction": 0.0,
+            "subject_threshold": threshold,
+            "subject_fraction_at_or_above_threshold": 0.0,
+        }
     try:
-        info = json.loads(path.read_text()); arr = np.load(root / "index" / "subject.npy", mmap_mode="r")
-        if not info.get("generation") or not meta.get("generation"): return {"subject_status": "stale", "subject_reason": "generation metadata missing", "subject_coverage": 0, "subject_coverage_fraction": 0.0}
-        if str(info.get("generation")) != str(meta.get("generation")): return {"subject_status": "stale", "subject_reason": "generation mismatch", "subject_coverage": 0, "subject_coverage_fraction": 0.0}
-        if tuple(arr.shape) != (expected,): return {"subject_status": "stale", "subject_reason": "array shape mismatch", "subject_coverage": 0, "subject_coverage_fraction": 0.0}
-        threshold = 0.5
+        info = json.loads(path.read_text())
+        arr = np.load(root / "index" / "subject.npy", mmap_mode="r")
+        if not info.get("generation") or not meta.get("generation"):
+            return {
+                "subject_status": "stale",
+                "subject_reason": "generation metadata missing",
+                "subject_coverage": 0,
+                "subject_coverage_fraction": 0.0,
+                "subject_threshold": threshold,
+                "subject_fraction_at_or_above_threshold": 0.0,
+            }
+        if str(info.get("generation")) != str(meta.get("generation")):
+            return {
+                "subject_status": "stale",
+                "subject_reason": "generation mismatch",
+                "subject_coverage": 0,
+                "subject_coverage_fraction": 0.0,
+                "subject_threshold": threshold,
+                "subject_fraction_at_or_above_threshold": 0.0,
+            }
+        if tuple(arr.shape) != (expected,):
+            return {
+                "subject_status": "stale",
+                "subject_reason": "array shape mismatch",
+                "subject_coverage": 0,
+                "subject_coverage_fraction": 0.0,
+                "subject_threshold": threshold,
+                "subject_fraction_at_or_above_threshold": 0.0,
+            }
         coverage = int(len(arr))
-        return {"subject_status": "valid", "subject_reason": "ok", "subject_coverage": coverage, "subject_coverage_fraction": coverage / expected if expected else 1.0, "subject_fraction_at_or_above_0.5": float(np.mean(np.asarray(arr) >= threshold)) if len(arr) else 0.0}
-    except Exception as exc: return {"subject_status": "stale", "subject_reason": f"unreadable: {exc}", "subject_coverage": 0, "subject_coverage_fraction": 0.0}
+        return {
+            "subject_status": "valid",
+            "subject_reason": "ok",
+            "subject_coverage": coverage,
+            "subject_coverage_fraction": coverage / expected if expected else 1.0,
+            "subject_threshold": threshold,
+            "subject_fraction_at_or_above_threshold": float(np.mean(np.asarray(arr) >= threshold)) if len(arr) else 0.0,
+        }
+    except Exception as exc:
+        return {
+            "subject_status": "stale",
+            "subject_reason": f"unreadable: {exc}",
+            "subject_coverage": 0,
+            "subject_coverage_fraction": 0.0,
+            "subject_threshold": threshold,
+            "subject_fraction_at_or_above_threshold": 0.0,
+        }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1211,8 +1308,14 @@ def main(argv: list[str] | None = None) -> int:
     pca.add_argument("--sample", type=int, default=200_000)
     pca.add_argument("--seed", type=int, default=0)
     stats = sub.add_parser("stats"); stats.add_argument("--config")
-    sal = sub.add_parser("saliency"); sal.add_argument("--config"); sal.add_argument("--device", default="cuda"); sal.add_argument("--batch-size", type=int, default=8); sal.add_argument("--shard"); sal.add_argument("--limit", type=int)
-    si = sub.add_parser("subject-index"); si.add_argument("--config")
+    sal = sub.add_parser("saliency")
+    sal.add_argument("--config")
+    sal.add_argument("--device", default="cuda")
+    sal.add_argument("--batch-size", type=int, default=8)
+    sal.add_argument("--shard")
+    sal.add_argument("--limit", type=int)
+    si = sub.add_parser("subject-index")
+    si.add_argument("--config")
     neigh = sub.add_parser("neighbours"); neigh.add_argument("--n", type=int, default=12); neigh.add_argument("--k", type=int, default=8); neigh.add_argument("--seed", type=int, default=0); neigh.add_argument("--out"); neigh.add_argument("--config")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -1233,10 +1336,21 @@ def main(argv: list[str] | None = None) -> int:
         shard = None
         if args.shard:
             try:
-                i, n = (int(x) for x in args.shard.split("/", 1)); shard = (i, n)
-                if n <= 0 or i < 0 or i >= n: raise ValueError
-            except ValueError as exc: raise SystemExit("--shard must be I/N with 0 <= I < N") from exc
-        print(json.dumps(build_subject_scores(root, device=args.device, cache_dir=paths.hf_cache, batch_size=args.batch_size, shard=shard, limit=args.limit), indent=2, sort_keys=True))
+                i, n = (int(x) for x in args.shard.split("/", 1))
+                if n <= 0 or i < 0 or i >= n:
+                    raise ValueError
+                shard = (i, n)
+            except ValueError as exc:
+                raise SystemExit("--shard must be I/N with 0 <= I < N") from exc
+        summary = build_subject_scores(
+            root,
+            device=args.device,
+            cache_dir=paths.hf_cache,
+            batch_size=args.batch_size,
+            shard=shard,
+            limit=args.limit,
+        )
+        print(json.dumps(summary, indent=2, sort_keys=True))
     elif args.command == "subject-index":
         print(json.dumps(build_subject_index(root), indent=2, sort_keys=True))
     elif args.command == "neighbours":
