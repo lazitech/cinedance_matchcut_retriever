@@ -43,6 +43,26 @@ the `pca` command after consolidating before using PCA coarse search.
 For the full library, pass `--preload` to the query, app, or self-test command to keep fingerprints
 and masks in RAM (about 29 GB, plus PCA projections).
 
+### Subject filter
+
+The subject filter uses BiRefNet saliency to keep library objects that are a main subject of their
+frame. It is a hard candidate filter in both soft and hard ranking modes; the query mask is never
+filtered. The default threshold is `min_subject_score = 0.5` (set it to `0` to disable filtering).
+
+Run the GPU saliency pass, then publish the consolidated subject index:
+
+```bash
+.venv/bin/python -m matchcut_retriever.library saliency --config configs/local.toml --device cuda
+.venv/bin/python -m matchcut_retriever.library subject-index --config configs/local.toml
+```
+
+The saliency pass writes each part's `saliency.npz` (uint8 maps downsampled to long side 160),
+`saliency.json` (model and scoring metadata), and `subject.npy` (float16 per-object mask means).
+`subject-index` writes `index/subject.npy` and `index/subject.json`, aligned to `object_id` and tied
+to the current index generation. Use the CLI override `query --min-subject SCORE`, or adjust the
+**Minimum subject score** slider in the app. If the subject index is absent or stale, retrieval
+continues without filtering and reports that state in its results.
+
 ## Gradio UI
 
 Queries load SAM and CLIP, so run the UI on the GPU server with both extras installed

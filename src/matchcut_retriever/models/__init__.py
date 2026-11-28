@@ -8,6 +8,7 @@ without torch or transformers installed.
 from .common import Detection, filter_detections, mask_nms, point_grid, stability_score
 from .segmentation import PanopticSegmenter, SamAutoSegmenter, SamPointSegmenter
 from .clip import ClipEmbedder, prepare_masked_crop
+from .saliency import SaliencyModel
 
 __all__ = [
     "Detection",
@@ -20,4 +21,5 @@ __all__ = [
     "SamPointSegmenter",
     "ClipEmbedder",
     "prepare_masked_crop",
+    "SaliencyModel",
 ]

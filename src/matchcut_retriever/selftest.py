@@ -26,14 +26,14 @@ from .retrieval import Library, QueryObject, rank
 from .retrieval_config import load_retrieval_config, override_config
 
 
-def sample_object_ids(objects, n: int = 200, seed: int = 0) -> list[int]:
+def sample_object_ids(objects, n: int = 200, seed: int = 0, eligible_ids: np.ndarray | None = None) -> list[int]:
     """Return a deterministic uniform sample of object ids without replacement."""
-    size = len(objects)
+    ids = np.arange(len(objects), dtype=np.int64) if eligible_ids is None else np.asarray(eligible_ids, dtype=np.int64)
+    size = len(ids)
     if size == 0 or n <= 0:
         return []
     count = min(int(n), size)
     rng = np.random.default_rng(int(seed))
-    ids = np.arange(size, dtype=np.int64)
     return [int(value) for value in rng.choice(ids, size=count, replace=False)]
 
 
@@ -151,6 +151,9 @@ def _bucket(area_frac: float) -> str:
 def summarize_records(records: Iterable[dict[str, Any]], k_values: tuple[int, ...] = (1, 10, 50)) -> dict[str, Any]:
     records = list(records)
     summary: dict[str, Any] = {"n": len(records), "modes": {}, "sam": {}}
+    if records:
+        for key in ("min_subject_score", "eligible_pool_size"):
+            if key in records[0]: summary[key] = records[0][key]
     recorded_k = [int(record["k_max"]) for record in records if record.get("k_max") is not None]
     supported_max = min(recorded_k) if recorded_k else max(k_values, default=0)
     cutoffs = tuple(sorted(set(k_values) | ({supported_max} if recorded_k else set())))
@@ -200,6 +203,8 @@ def summarize_records(records: Iterable[dict[str, Any]], k_values: tuple[int, ..
 
 def _markdown(summary: dict[str, Any]) -> str:
     lines = ["# Match-cut retriever self-test", "", "| Mask source | Mode | Coarse method | n | Recall@1 | Recall@10 | Recall@50 | Exact object | Median rank time (s) |", "|---|---|---:|---:|---:|---:|---:|---:|---:|"]
+    if "min_subject_score" in summary:
+        lines += [f"Subject filter: threshold {float(summary['min_subject_score']):.3f}; eligible pool {int(summary.get('eligible_pool_size', 0))}.", ""]
     for source, modes in summary.get("modes", {}).items():
         for mode, item in modes.items():
             recall = item["recall"]
@@ -221,7 +226,7 @@ def _markdown(summary: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def run_selftest(library_root: str | Path, out: str | Path, n: int = 200, seed: int = 0, mask_source: str = "both", modes: Iterable[str] = ("soft", "hard"), k_max: int = 50, semantic: float = 0.0, config_path: str | Path | None = None, retrieval_config: str | Path | None = None, device: str = "cuda:0", workers: int | None = None, coarse_n: int | None = None, hard_coarse_n: int | None = None, coarse_method: str | None = None, pca_shortlist_factor: int | None = None, preload: bool = False, shard: str | None = None, point_segmenter: Any = None, embedder: Any = None, render_failures: int = 0) -> dict[str, Any]:
+def run_selftest(library_root: str | Path, out: str | Path, n: int = 200, seed: int = 0, mask_source: str = "both", modes: Iterable[str] = ("soft", "hard"), k_max: int = 50, semantic: float = 0.0, config_path: str | Path | None = None, retrieval_config: str | Path | None = None, device: str = "cuda:0", workers: int | None = None, coarse_n: int | None = None, hard_coarse_n: int | None = None, coarse_method: str | None = None, pca_shortlist_factor: int | None = None, min_subject_score: float | None = None, preload: bool = False, shard: str | None = None, point_segmenter: Any = None, embedder: Any = None, render_failures: int = 0) -> dict[str, Any]:
     """Run or resume the self-test and write summary.json/summary.md."""
     root, out = Path(library_root), Path(out)
     out.mkdir(parents=True, exist_ok=True)
@@ -233,7 +238,12 @@ def run_selftest(library_root: str | Path, out: str | Path, n: int = 200, seed: 
     records_path = out / (f"records-{shard_index:03d}-of-{shard_count:03d}.jsonl" if shard_count > 1 else "records.jsonl")
     existing = {int(r.get("sample_index")) for r in _load_records(out)}
     config = load_retrieval_config(retrieval_config)
-    config = override_config(config, semantic_weight=float(semantic), workers=workers, coarse_n=coarse_n, hard_coarse_n=hard_coarse_n, coarse_method=coarse_method, pca_shortlist_factor=pca_shortlist_factor, k=int(k_max))
+    config = override_config(config, semantic_weight=float(semantic), workers=workers, coarse_n=coarse_n, hard_coarse_n=hard_coarse_n, coarse_method=coarse_method, pca_shortlist_factor=pca_shortlist_factor, min_subject_score=min_subject_score, k=int(k_max))
+    threshold = float(config.min_subject_score)
+    if threshold > 0 and library.subject_status == "valid" and library.subject_score is not None:
+        eligible = np.flatnonzero(np.asarray(library.subject_score) >= threshold)
+    else:
+        eligible = np.arange(len(library.objects), dtype=np.int64)
     modes = [str(m).strip().lower() for m in modes if str(m).strip()]
     if any(mode not in {"soft", "hard"} for mode in modes):
         raise ValueError("modes must contain only soft and hard")
@@ -250,11 +260,11 @@ def run_selftest(library_root: str | Path, out: str | Path, n: int = 200, seed: 
         paths = load_paths(config_path)
         embedder = ClipEmbedder(device=device, cache_dir=paths.hf_cache)
     with records_path.open("a", encoding="utf-8") as stream:
-        for sample_index, object_id in enumerate(sample_object_ids(library.objects, n, seed)):
+        for sample_index, object_id in enumerate(sample_object_ids(library.objects, n, seed, eligible)):
             if sample_index % shard_count != shard_index or sample_index in existing:
                 continue
             row = library.objects.iloc[int(object_id)]
-            record: dict[str, Any] = {"sample_index": sample_index, "object_id": int(object_id), "clip_id": str(row.clip_id), "shot_no": int(row.shot_no), "keyframe_id": str(row.keyframe_id), "area_frac": float(row.area_frac), "segmenter": str(row.segmenter), "k_max": int(k_max), "results": {}}
+            record: dict[str, Any] = {"sample_index": sample_index, "object_id": int(object_id), "clip_id": str(row.clip_id), "shot_no": int(row.shot_no), "keyframe_id": str(row.keyframe_id), "area_frac": float(row.area_frac), "segmenter": str(row.segmenter), "k_max": int(k_max), "min_subject_score": threshold, "eligible_pool_size": int(len(eligible)), "results": {}}
             try:
                 image = np.asarray(Image.open(library.keyframe_path(row.keyframe_id)).convert("RGB"), dtype=np.uint8)
                 source_mask = library.mask(object_id)
@@ -304,6 +314,10 @@ def run_selftest(library_root: str | Path, out: str | Path, n: int = 200, seed: 
             stream.flush()
     records = _load_records(out)
     summary = summarize_records(records)
+    # Keep the filter context in the summary even when no eligible objects
+    # produced a record (for example, a threshold above every score).
+    summary["min_subject_score"] = threshold
+    summary["eligible_pool_size"] = int(len(eligible))
     (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     (out / "summary.md").write_text(_markdown(summary))
     print((out / "summary.md").read_text(), end="")
@@ -315,7 +329,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config"); parser.add_argument("--retrieval-config"); parser.add_argument("--library-root")
     parser.add_argument("--out", required=True); parser.add_argument("--n", type=int, default=200); parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--mask-source", choices=("sam", "gt", "both"), default="both"); parser.add_argument("--modes", default="soft,hard"); parser.add_argument("--k-max", type=int, default=50)
-    parser.add_argument("--semantic", type=float, default=0.0); parser.add_argument("--device", default="cuda:0"); parser.add_argument("--workers", type=int); parser.add_argument("--coarse-n", type=int); parser.add_argument("--hard-coarse-n", type=int); parser.add_argument("--coarse-method", choices=("auto", "exact", "pca")); parser.add_argument("--pca-shortlist-factor", type=int)
+    parser.add_argument("--semantic", type=float, default=0.0); parser.add_argument("--min-subject", type=float, default=None); parser.add_argument("--device", default="cuda:0"); parser.add_argument("--workers", type=int); parser.add_argument("--coarse-n", type=int); parser.add_argument("--hard-coarse-n", type=int); parser.add_argument("--coarse-method", choices=("auto", "exact", "pca")); parser.add_argument("--pca-shortlist-factor", type=int)
     parser.add_argument("--preload", action="store_true", help="load shape fingerprints and masks into RAM"); parser.add_argument("--shard"); parser.add_argument("--summarize-only", action="store_true"); parser.add_argument("--render-failures", type=int, default=0)
     return parser
 
@@ -327,7 +341,7 @@ def main(argv: list[str] | None = None) -> int:
         summary = summarize_records(_load_records(out)); (out / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n"); (out / "summary.md").write_text(_markdown(summary)); print((out / "summary.md").read_text(), end=""); return 0
     if not args.library_root:
         args.library_root = str(load_paths(args.config).library_root)
-    run_selftest(args.library_root, out, n=args.n, seed=args.seed, mask_source=args.mask_source, modes=args.modes.split(","), k_max=args.k_max, semantic=args.semantic, config_path=args.config, retrieval_config=args.retrieval_config, device=args.device, workers=args.workers, coarse_n=args.coarse_n, hard_coarse_n=args.hard_coarse_n, coarse_method=args.coarse_method, pca_shortlist_factor=args.pca_shortlist_factor, preload=args.preload, shard=args.shard, render_failures=args.render_failures)
+    run_selftest(args.library_root, out, n=args.n, seed=args.seed, mask_source=args.mask_source, modes=args.modes.split(","), k_max=args.k_max, semantic=args.semantic, config_path=args.config, retrieval_config=args.retrieval_config, device=args.device, workers=args.workers, coarse_n=args.coarse_n, hard_coarse_n=args.hard_coarse_n, coarse_method=args.coarse_method, pca_shortlist_factor=args.pca_shortlist_factor, min_subject_score=args.min_subject, preload=args.preload, shard=args.shard, render_failures=args.render_failures)
     return 0
 
 
