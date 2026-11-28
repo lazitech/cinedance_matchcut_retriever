@@ -20,6 +20,10 @@ gpu = [
     "transformers>=4.56",
     "scipy>=1.11",
     "huggingface_hub>=0.24",
+    # BiRefNet saliency (remote code, pinned revision) needs these at import time.
+    "timm>=1.0",
+    "kornia>=0.7",
+    "einops>=0.7",
 ]
 
 # Gradio query UI (stage 7); run on the GPU server, CPU inference is fine.
